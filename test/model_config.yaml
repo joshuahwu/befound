@@ -1,0 +1,48 @@
+data:
+  arena_size:
+  - - -200
+    - -200
+    - 10
+  - - 200
+    - 200
+    - 200
+  batch_size: 2048
+  data_path: /mnt/home/jwu10/working/ceph/data/wu_iclr25/
+  dataset: 4_mice
+  direction_process: midfwd
+  normalize: z_score
+  remove_speed_outliers: 2.25
+disentangle:
+  alpha: null
+  balance_loss: null
+  bandwidth: null
+  features: []
+  method: {}
+  polynomial: null
+  var_mode: null
+loss:
+  jpe: 1
+  prior: 1
+  root: 1
+model:
+  activation: prelu
+  channel:
+  - 128
+  - 256
+  - 512
+  diag: true
+  init_dilation: null
+  kernel: 3
+  load_model: null
+  prior: gaussian
+  start_epoch: 0
+  type: rcnn
+  window: 51
+  z_dim: 64
+out_path: /mnt/ceph/users/jwu10/results/wu_iclr25/vae/midfwd_2/
+train:
+  beta_anneal: false
+  lr: 0.0001
+  lr_schedule: null
+  num_epochs: 400
+  optimizer: adamw

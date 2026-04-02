@@ -1,0 +1,25 @@
+PARAM_KEYS = dict(
+    data=[
+        "batch_size",
+        "data_path",
+        "dataset",
+        "direction_process",
+        "normalize",
+        "remove_speed_outliers",
+    ],
+    model=[
+        "activation",
+        "depth",
+        "hidden_dim",
+        "init_dilation",
+        "latent_dim",
+        "load_model",
+        "out_kernel_size",
+        "prior",
+        "query_size",
+        "start_epoch",
+        "type",
+        "window",
+    ],
+    train=["beta_anneal", "lr", "num_epochs", "optimizer", "lr_schedule", "minimal_test"],
+)
