@@ -1,7 +1,8 @@
 import re
 from pathlib import Path
 import numpy as np
-from befound.data import MouseDataset, fwd_kin_cont6d_torch, preprocess_save_data
+import befound
+from befound.data import MouseDataset, MabeWindowDataset, fwd_kin_cont6d_torch, preprocess_save_data
 from befound.data.constants import OFFSETS_3D, OFFSETS_3D_SUM
 from torch.utils.data import DataLoader
 import h5py
@@ -11,6 +12,138 @@ from torch import optim
 from typing import List, Dict, Optional
 from neuroposelib import read
 
+import os
+import copy
+
+def fill_holes(data):
+    clean_data = copy.deepcopy(data)
+    
+    for m in range(3):
+        holes = np.where(clean_data[0, m, :, 0] == 0)[0]  # [0] 直接取出 1D array
+        for h in holes:
+            sub = np.where(clean_data[:, m, h, 0] != 0)[0]
+            if sub.size > 0:
+                clean_data[0, m, h, :] = clean_data[sub[0], m, h, :]
+            else:
+                return np.empty((0))
+
+    for fr in range(1, clean_data.shape[0]):
+        for m in range(3):
+            holes = np.where(clean_data[fr, m, :, 0] == 0)[0]
+            for h in holes:
+                clean_data[fr, m, h, :] = clean_data[fr - 1, m, h, :]
+
+    return clean_data
+
+def get_mabe22_data(path, split="train", reindex=True):
+
+    # def _load(filename):
+    #     data = np.load(os.path.join(path, filename), allow_pickle=True).item()
+    #     return np.stack([d["keypoints"] for d in data["sequences"].values()])
+    def _load(filename):
+        data = np.load(os.path.join(path, filename), allow_pickle=True).item()
+        raw = np.stack([d["keypoints"] for d in data["sequences"].values()])
+        # raw: (N, T, 3, K, 2)
+
+        cleaned = []
+        for i in range(raw.shape[0]):
+            seq = raw[i]                   # (T, 3, K, 2)
+            result = fill_holes(seq)
+            if result.size == 0:
+                print(f"[warn] sequence {i} has unfillable holes, skipping")
+                continue
+            cleaned.append(result)
+
+        return np.stack(cleaned)           # (N', T, 3, K, 2)
+    
+
+    def _flatten_and_finalize(kp):
+        # kp: (N, T, n_mice, K, 2) -> (N*n_mice, T, K, 2)  + per-mouse video idx
+        N, T, n_mice, K, _ = kp.shape
+        flat = kp.transpose(0, 2, 1, 3, 4).reshape(-1, T, K, 2)
+        batch = np.repeat(np.arange(N), n_mice)
+        if reindex:
+            flat = flat[:, :, befound.data.constants.MABE_REINDEX, :]
+        return flat.astype(np.float32, copy=False), batch
+
+    if split == "all":
+        kp_train = _load("mouse_triplet_train.npy")
+        kp_sub   = _load("mouse_triplet_test.npy")
+        N_train  = kp_train.shape[0]
+        kp_full  = np.concatenate([kp_train, kp_sub], axis=0)
+        flat, batch = _flatten_and_finalize(kp_full)
+        split_mask = np.zeros(N_train + kp_sub.shape[0], dtype=bool)
+        split_mask[:N_train] = True
+        return flat, split_mask, batch
+
+    if split == "train":
+        kp = _load("mouse_triplet_train.npy")
+    elif split == "submission":
+        kp = _load("mouse_triplet_test.npy")
+    else:
+        raise ValueError(f"Invalid split: {split!r}")
+
+    return _flatten_and_finalize(kp)
+
+def get_mabe22_data_model(
+    config: dict,
+    train_val_test=["train","val"],
+    # data_keys=["x2d", "offsets", "target_pose"],
+    use_default_offsets=[True, True],
+    shuffle=[True, False],
+    # split: str = "train",
+    stride: int = 6,
+    num_workers: int = 2,
+):
+    """
+    One-stop loader: returns a DataLoader yielding {"pose": (B, W, K, 2)}.
+    """
+    
+    # val_data_keys = [
+    #             "x2d",
+    #             "offsets",
+    #             "target_pose",
+    #         ]
+    mabe_path = config["data"]["data_path"]
+    data_config = config["data"]
+    epoch = config["model"]["start_epoch"]
+    load_model = config["model"]["load_model"]
+    window = config["model"]["window"]
+
+    loader_dict = {}
+    for is_shuffle, is_default_offsets, dataset_label in zip(shuffle, use_default_offsets, train_val_test):
+        # curr_data_keys = val_data_keys if dataset_label == "val" else data_keys
+
+        if dataset_label == "val":
+            split = "submission"
+            stride = 20
+            pad_mode = "edge"
+        else:            
+            split = "train"
+            pad_mode = "edge"
+
+        kp, _batch = get_mabe22_data(mabe_path, split=split, reindex=True)
+        ds = MabeWindowDataset(kp, window=window, stride=stride, pad_mode=pad_mode)
+        loader_dict[dataset_label] = DataLoader(
+            ds,
+            batch_size=data_config["batch_size"],
+            shuffle=is_shuffle,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,                # so train batches are uniform
+            persistent_workers=num_workers > 0,
+        )
+
+    model = get_model(
+        model_config=config["model"],
+        load_model=load_model,
+        epoch=epoch,
+        n_keypts=loader_dict[train_val_test[0]].dataset.n_keypts,
+        device="cuda",
+        verbose=True,
+    )
+
+    return loader_dict, model
 
 def data_and_model(
     config,
@@ -22,7 +155,7 @@ def data_and_model(
     use_default_val_keys=True,
     use_default_offsets=[True, True, True],
     verbose=1,
-):
+):  
     if use_default_val_keys:
         if config["data"]["dataset"] == "4_mice":
             val_data_keys = [
@@ -33,6 +166,12 @@ def data_and_model(
                 "offsets",
                 "target_pose",
             ]
+        # if config["data"]["dataset"] == "mabe22":
+        #     val_data_keys = [
+        #         "x2d",
+        #         "offsets",
+        #         "target_pose",
+        #     ]
         else:
             val_data_keys = [
                 "ids",
@@ -313,3 +452,5 @@ def get_model(
             print("Unexpected Keys: {}".format(unexpected_keys))
 
     return vae.to(device)
+
+

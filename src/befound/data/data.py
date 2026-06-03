@@ -1,3 +1,4 @@
+import befound
 from neuroposelib import read
 import numpy as np
 import befound.data.quaternion as qtn
@@ -383,31 +384,7 @@ def preprocess_save_data(
     direction_process: str = "midfwd",
     use_default_offsets: bool = False,
 ):
-    """Prepare and save all data preprocessing for SC-VAE model training, validation, and testing
 
-    Parameters
-    ----------
-    data_path : str
-        Path to folder with datasets
-    skeleton_config : dict
-        Configuration file denoting the structure of the skeleton
-    dataset : str
-        Which dataset to prepare (i.e., "4_mice", "parkinsons")
-    data_keys : List[str], optional
-        Keys of data to save, by default ["x6d", "root", "offsets"]
-    speed_threshold : Optional[float], optional
-        Action segments with greater average speed will be filtered out, by default 2.25
-    direction_process : str, optional
-        Preprocess pose sequences such that the animals pass through the origin at the middle frame from
-        any direction ("x360") or only in the x+ direction ("midfwd"), by default "midfwd"
-    use_default_offsets : bool, optional
-        Whether to use default segment lengths for offsets, by default False
-
-    Returns
-    -------
-    data
-        Dictionary with key-value pairs associated with `data_keys`
-    """
     n_ids = 72 if "parkinsons" in dataset else 4
     print("Calculating dataset: {}".format(dataset))
     dataset_name = "parkinsons" if dataset == "parkinsons_healthy" else dataset
@@ -619,3 +596,162 @@ class MouseDataset(Dataset):
         #     for k, v in self.data.items()
         # }
         return query
+
+
+
+
+
+
+
+
+
+# befound/data/mabe22_dataset.py
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+# class MabeWindowDataset(Dataset):
+#     def __init__(
+#         self,
+#         keypoints: np.ndarray,    # (N_traj, T, K, 2) float32, already reindexed
+#         window: int = 51,
+#         stride: int = 1,
+#         pad_mode: str = "edge",
+#         filter_invalid_center: bool = True,
+#         center_required_kpts: tuple = (0,1),   # 中心帧上必须有效的 kpt index
+#     ):
+#         assert keypoints.ndim == 4 and keypoints.shape[-1] == 2, (
+#             f"expected (N_traj, T, K, 2), got {keypoints.shape}"
+#         )
+#         self.window = window
+#         self.stride = stride
+#         self.half   = window // 2
+
+#         N, T, K, _ = keypoints.shape
+
+#         if pad_mode == "edge":
+#             pad_widths = ((0, 0), (self.half, self.half), (0, 0), (0, 0))
+#             self.padded = np.pad(keypoints, pad_widths, mode=pad_mode).astype(
+#                 np.float32, copy=False,
+#             )
+#         elif pad_mode == "no_pad":
+#             self.padded = keypoints.astype(np.float32, copy=False)
+#         else:
+#             raise ValueError(f"invalid pad_mode {pad_mode}")
+
+#         # ---- 构建完整的 (traj, center_t) 索引 ----
+#         centres = np.arange(0, T, stride, dtype=np.int64)            # (M,)
+#         traj_idx_full = np.repeat(np.arange(N, dtype=np.int64), len(centres))
+#         center_t_full = np.tile(centres, N)
+
+#         # ---- 根据 raw（未 pad）keypoints 过滤中心帧失效的窗口 ----
+#         if filter_invalid_center:
+#             # missing: (N, T, K), True 表示该 kpt 缺失
+#             missing = (keypoints[..., 0] == 0) & (keypoints[..., 1] == 0)
+
+#             req = np.asarray(center_required_kpts, dtype=np.int64)
+#             # 中心帧上任一必需 kpt 缺失即视为 invalid
+#             missing_at_center = missing[:, :, req].any(axis=-1)      # (N, T)
+
+#             invalid = missing_at_center[traj_idx_full, center_t_full]
+#             keep = ~invalid
+
+#             n_total, n_kept = len(traj_idx_full), int(keep.sum())
+#             self._n_filtered = n_total - n_kept
+#             print(
+#                 f"[MabeWindowDataset] filtered {self._n_filtered}/{n_total} "
+#                 f"windows ({100 * self._n_filtered / max(n_total, 1):.2f}%) "
+#                 f"with invalid center kpts {tuple(center_required_kpts)}"
+#             )
+
+#             self.traj_idx = traj_idx_full[keep]
+#             self.center_t = center_t_full[keep]
+#         else:
+#             self._n_filtered = 0
+#             self.traj_idx = traj_idx_full
+#             self.center_t = center_t_full
+
+#         self._n_traj = N
+#         self._T      = T
+#         self._K      = K
+#         self.n_keypts        = K
+#         self.offsets_sum     = float(befound.data.constants.OFFSETS_3D_MABE22_SUM)
+#         self.kinematic_tree  = None
+
+#     def __len__(self):
+#         return len(self.traj_idx)
+
+#     def __getitem__(self, idx):
+#         n  = self.traj_idx[idx]
+#         t  = self.center_t[idx]
+#         win = self.padded[n, t : t + self.window]
+#         return {"pose": torch.from_numpy(win)}
+
+
+class MabeWindowDataset(Dataset):
+    """
+    Sliding-window view over MABe22 per-mouse trajectories.
+
+    __getitem__ returns a single window {"pose": (W, K, 2) float32}.
+    The DataLoader's default collate then stacks B of these into
+    (B, W, K, 2), which is exactly what `prepare_batch_2d_bespoke`
+    (path A) expects in `data["pose"]`.
+    """
+
+    def __init__(
+        self,
+        keypoints: np.ndarray,    # (N_traj, T, K, 2) float32, already reindexed
+        window: int = 51,
+        stride: int = 1,
+        pad_mode: str = "edge",
+    ):
+        assert keypoints.ndim == 4 and keypoints.shape[-1] == 2, (
+            f"expected (N_traj, T, K, 2), got {keypoints.shape}"
+        )
+        self.window = window
+        self.stride = stride
+        self.half   = window // 2
+
+        # Pad each trajectory once on the time axis. Edge-pad replicates the
+        # first/last frame, which avoids spurious "missing-keypoint" zeros
+        # at trajectory boundaries (0 collides with MABe's missing marker).
+        N, T, K, _ = keypoints.shape
+
+        if pad_mode == "edge":
+            pad_widths = ((0, 0), (self.half, self.half), (0, 0), (0, 0))
+            self.padded = np.pad(keypoints, pad_widths, mode=pad_mode).astype(
+                np.float32, copy=False,
+            )                                      # (N, T+W-1, K, 2)
+        elif pad_mode == "no_pad":
+            self.padded = keypoints.astype(np.float32, copy=False)
+        else:
+            raise ValueError(f"invalid pad_mode {pad_mode}")
+
+        # Build a flat (traj_idx, center_t) index. Cheap to keep around.
+        centres = np.arange(0, T, stride, dtype=np.int64)        # (M,)
+        self.M = len(centres)
+        self.traj_idx = np.repeat(np.arange(N, dtype=np.int64), self.M)
+        self.center_t = np.tile(centres, N)                      # in original (un-padded) frames
+        self._n_traj = N
+        self._T      = T
+        self._K      = K
+        
+        self.n_keypts        = K
+        self.offsets_sum     = float(befound.data.constants.OFFSETS_3D_MABE22_SUM)
+        self.kinematic_tree  = None   # MABe22 has no inverse-kin
+
+        # self.label           = label
+
+
+    def __len__(self):
+        return len(self.traj_idx)
+
+    def __getitem__(self, idx):
+        n  = self.traj_idx[idx]
+        t  = self.center_t[idx]
+        # Centre frame `t` maps to padded index `t + half`; window is
+        # padded[n, t : t + W] which covers frames [t-half, t+half].
+        win = self.padded[n, t : t + self.window]                 # (W, K, 2)
+        return {"pose": torch.from_numpy(win)}                    # default collate stacks dim 0
+
+

@@ -1,4 +1,6 @@
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from befound.train.losses import get_batch_loss
 import torch.optim as optim
 import tqdm
@@ -6,7 +8,7 @@ import time
 import wandb
 from line_profiler import profile
 from pathlib import Path
-from befound.data.train_utils import get_x3d_from_data, prepare_batch
+from befound.data.train_utils import get_x3d_from_data, prepare_batch, prepare_batch_2d_bespoke
 import copy
 
 
@@ -91,6 +93,7 @@ def train_test_epoch(
     optimizer=None,
     scheduler=None,
     mode="train",
+    rank=0,
 ):
     if mode == "train":
         model.train()
@@ -101,8 +104,10 @@ def train_test_epoch(
     else:
         raise ValueError("This mode is not recognized.")
 
+
     kinematic_tree = loader.dataset.kinematic_tree
     offsets_sum = loader.dataset.offsets_sum
+    
     with grad_env():
         epoch_metrics = {k: 0 for k in ["total"] + list(config["loss"].keys())}
         for batch_idx, data in enumerate(loader):
@@ -112,18 +117,32 @@ def train_test_epoch(
             # }
 
             # data["x3d"] = get_x3d_from_data(data, offsets_sum, kinematic_tree)
-            data = prepare_batch(
-                data=data,
-                augment_dict=config["train"]["augmentations"],
-                offsets_sum=offsets_sum,
-                kinematic_tree=kinematic_tree,
-                device=device,
-                get_2d=config["model"]["is_2d"],
-            )
+
+            if config["data"]["dataset"] == "mabe22":
+                data = prepare_batch_2d_bespoke(
+                    data=data,
+                    augment_dict=config["train"]["augmentations"],
+                    offsets_sum=offsets_sum,
+                    device=device,
+                )
+            elif config["data"]["dataset"] in ["4mice", "parkinsons_healthy"]:
+                data = prepare_batch(
+                    data=data,
+                    augment_dict=config["train"]["augmentations"],
+                    offsets_sum=offsets_sum,
+                    kinematic_tree=kinematic_tree,
+                    device=device,
+                    get_2d=config["model"]["is_2d"],
+                )
+            else:
+                raise ValueError("Dataset not recognized.")
+            
             data_o = predict_batch(model, data)
 
+            # Unwrap DDP so losses.py can access model attributes like model.prior
+            raw_model = model.module if isinstance(model, DDP) else model
             batch_loss = get_batch_loss(
-                model=model,
+                model=raw_model,
                 data=data,
                 data_o=data_o,
                 loss_scale=config["loss"],
@@ -147,18 +166,23 @@ def train_test_epoch(
                 k: v + batch_loss[k].detach() for k, v in epoch_metrics.items()
             }
 
+        # Calculate averages on all ranks
         for k, v in epoch_metrics.items():
             epoch_metrics[k] = v.item() / len(loader)
-            print(
-                "====> Epoch: {} Average {} loss: {:.4f}".format(
-                    epoch, k, epoch_metrics[k]
+        
+        # Only rank 0 prints
+        if rank == 0:
+            for k, v in epoch_metrics.items():
+                print(
+                    "====> Epoch: {} Average {} loss: {:.4f}".format(
+                        epoch, k, epoch_metrics[k]
+                    )
                 )
-            )
 
     return epoch_metrics
 
 
-def test_epoch(config, model, loader, device="cuda", epoch=0):
+def test_epoch(config, model, loader, device="cuda", epoch=0, rank=0):
     return train_test_epoch(
         config=config,
         model=model,
@@ -168,10 +192,11 @@ def test_epoch(config, model, loader, device="cuda", epoch=0):
         device=device,
         epoch=epoch,
         mode="test",
+        rank=rank,
     )
 
 
-def train_epoch(config, model, loader, optimizer, scheduler, device="cuda", epoch=0):
+def train_epoch(config, model, loader, optimizer, scheduler, device="cuda", epoch=0, rank=0):
     return train_test_epoch(
         config=config,
         model=model,
@@ -181,11 +206,13 @@ def train_epoch(config, model, loader, optimizer, scheduler, device="cuda", epoc
         device=device,
         epoch=epoch,
         mode="train",
+        rank=rank,
     )
 
 
 # @profile
-def train(config, model, loader_dict, run=None):
+def train(config, model, loader_dict, run=None, rank=0):
+    
     torch.set_float32_matmul_precision("medium")
     torch.autograd.set_detect_anomaly(True)
     torch.backends.cudnn.benchmark = True
@@ -211,10 +238,15 @@ def train(config, model, loader_dict, run=None):
     for epoch in tqdm.trange(
         config["model"]["start_epoch"] + 1, config["train"]["num_epochs"] + 1
     ):
+        # Set epoch on DistributedSampler for correct per-epoch shuffling
+        if hasattr(loader_dict["train"].sampler, "set_epoch"):
+            loader_dict["train"].sampler.set_epoch(epoch)
+
         # Update beta annealing if applicable
         if beta_scheduler is not None:
             config["loss"]["prior"] = beta_scheduler.get(epoch)
-            print("Beta schedule: {:.3f}".format(config["loss"]["prior"]))
+            if rank == 0:
+                print("Beta schedule: {:.3f}".format(config["loss"]["prior"]))
 
         starttime = time.time()
         # Train for an epoch
@@ -226,14 +258,19 @@ def train(config, model, loader_dict, run=None):
             scheduler=scheduler,
             device="cuda",
             epoch=epoch,
+            rank=rank,
         )
         metrics = {"{}_train".format(k): v for k, v in train_metrics.items()}
         metrics["time"] = time.time() - starttime
 
-        if (epoch % 5 == 0) and (epoch > 1):
-            print("Saving model to folder: {}".format(config["out_path"]))
+        # Unwrap DDP module for saving
+        model_to_save = model.module if isinstance(model, DDP) else model
+
+        if (rank == 0) and (epoch % 5 == 0) and (epoch > 1):
+            if rank == 0:
+                print("Saving model to folder: {}".format(config["out_path"]))
             torch.save(
-                {k: v.cpu() for k, v in model.state_dict().items()},
+                {k: v.cpu() for k, v in model_to_save.state_dict().items()},
                 "{}/weights/epoch_{}.pth".format(config["out_path"], epoch),
             )
 
@@ -243,7 +280,7 @@ def train(config, model, loader_dict, run=None):
                     "{}/checkpoints/epoch_{}.pth".format(config["out_path"], epoch),
                 )
 
-            ## Calculate test metrics
+            ## Calculate test metrics (rank 0 only)
             if epoch >= 50:
                 config_test = copy.deepcopy(config)
                 config_test["train"]["augmentations"] = {
@@ -251,14 +288,18 @@ def train(config, model, loader_dict, run=None):
                     "kpt_shuffle": None,
                     "offset_noise": None,
                     "single_ablation": None,
+                    "temporal_mask_past": None,
+                    "temporal_mask_future": None,
+                    "temporal_mask_random": None,
                 }
-                # Round 1 
+                # Round 1
                 test_metrics = test_epoch(
                     config=config_test,
                     model=model,
                     loader=loader_dict["val"],
                     device="cuda",
                     epoch=epoch,
+                    rank=rank,
                 )
 
                 metrics.update(
@@ -273,6 +314,9 @@ def train(config, model, loader_dict, run=None):
                     "kpt_shuffle": True,
                     "offset_noise": None,
                     "single_ablation": None,
+                    "temporal_mask_past": None,
+                    "temporal_mask_future": None,
+                    "temporal_mask_random": None,
                 }
                 test_metrics = test_epoch(
                     config=config_test,
@@ -280,6 +324,7 @@ def train(config, model, loader_dict, run=None):
                     loader=loader_dict["val"],
                     device="cuda",
                     epoch=epoch,
+                    rank=rank,
                 )
                 metrics.update(
                     {"{}_test_kpt_shuffle".format(k): v for k, v in test_metrics.items()}
@@ -291,6 +336,9 @@ def train(config, model, loader_dict, run=None):
                     "kpt_shuffle": None,
                     "offset_noise": None,
                     "single_ablation": None,
+                    "temporal_mask_past": None,
+                    "temporal_mask_future": None,
+                    "temporal_mask_random": None,
                 }
                 test_metrics = test_epoch(
                     config=config_test,
@@ -298,6 +346,7 @@ def train(config, model, loader_dict, run=None):
                     loader=loader_dict["val"],
                     device="cuda",
                     epoch=epoch,
+                    rank=rank,
                 )
                 metrics.update(
                     {"{}_test_2d_td".format(k): v for k, v in test_metrics.items()}
@@ -309,6 +358,9 @@ def train(config, model, loader_dict, run=None):
                     "kpt_shuffle": None,
                     "offset_noise": None,
                     "single_ablation": 1.0,
+                    "temporal_mask_past": None,
+                    "temporal_mask_future": None,
+                    "temporal_mask_random": None,
                 }
                 test_metrics = test_epoch(
                     config=config_test,
@@ -316,11 +368,20 @@ def train(config, model, loader_dict, run=None):
                     loader=loader_dict["val"],
                     device="cuda",
                     epoch=epoch,
+                    rank=rank,
                 )
                 metrics.update(
                     {"{}_test_single_ablation".format(k): v for k, v in test_metrics.items()}
                 )
 
-        wandb.log(metrics, epoch)
+        # All ranks barrier here - wait for rank 0 to finish checkpointing and validation
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        if run is not None:
+            wandb.log(metrics, epoch)
 
     return model
+
+
+# /hpc/home/yw789/tdunn/befound_code/befound/src/befound/train/trainer.py

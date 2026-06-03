@@ -37,12 +37,8 @@ run = wandb.init(
 print("WANDB directory: {}".format(run.dir))
 
 # Get DataLoaders and model
-loader_dict, model = befound.get.data_and_model(
-    config,
-    train_val_test=["train","val"],
-    data_keys=["x6d", "root", "offsets", "target_pose"],
-    shuffle=[True,False],
-    use_default_offsets=[True,False],
+loader_dict, model = befound.get.get_mabe22_data_model(
+    config
 )
 
 # Train model
@@ -50,7 +46,7 @@ model = befound.train.train(config, model, loader_dict, run)
 
 run.finish()
 
-# python train_model.py -p ci_vae -n 1_ablatel
+# python train_model_2d_bespoke.py -p f_vae -n 2d_bespoke_mabe
 
 
 

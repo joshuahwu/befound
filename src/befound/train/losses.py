@@ -141,6 +141,10 @@ def prior_loss(mu, logvar):
     KL_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     return KL_div / mu.shape[0]
 
+# def prior_loss(mu, logvar):
+#     logvar = torch.clamp(logvar, -10, 10)
+#     KL_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+#     return KL_div / mu.shape[0]
 
 def mpjpe_loss(pose, x_hat, kinematic_tree, offsets, root_hat=None):
     """
@@ -259,6 +263,24 @@ def get_batch_loss(
                 / data_o["x2d"].shape[-2]
                 / data_o["x2d"].shape[-1]
             )
+            
+            # data_o["x2d"]: (N, W, K, 2);  loss_mask: (N, W)
+            # if "loss_mask" in data:
+            #     sq_err = ((data_o["x2d"] - data_o["x2d"][:, :, 0:1]) * offsets_sum
+            #             - data["target_pose"][..., :2]) ** 2          # (N, W, K, 2)
+            #     m = data["loss_mask"][..., None, None].float()           # (N, W, 1, 1)
+            #     n_valid = m.sum().clamp_min(1.0)
+            #     batch_loss["jpe"] = (sq_err * m).sum() / (n_valid * data_o["x2d"].shape[-2] * data_o["x2d"].shape[-1])
+            # else:
+            #     batch_loss["jpe"] = (
+            #     torch.nn.MSELoss(reduction="sum")(
+            #         (data_o["x2d"] - data_o["x2d"][:, :, 0:1]) * offsets_sum,
+            #         data["target_pose"][:, :, :, :2],
+            #     )
+            #     / batch_size
+            #     / data_o["x2d"].shape[-2]
+            #     / data_o["x2d"].shape[-1]
+            #     )
         else:
             batch_loss["jpe"] = mpjpe_loss(
                 data[
@@ -273,7 +295,14 @@ def get_batch_loss(
         if is_2d:
             batch_loss["root"] = torch.nn.MSELoss(reduction="sum")(
                 data_o["x2d"][:, :, 0] * offsets_sum, data["root"][:, :, :2]
-            )
+            ) / batch_size
+            # sq_err = (data_o["x2d"][:, :, 0] * offsets_sum
+            #       - data["root"][:, :, :2]) ** 2
+            # if "loss_mask" in data:
+            #     m = data["loss_mask"][..., None].float()           # (N, W, 1)
+            #     batch_loss["root"] = (sq_err * m).sum() / batch_size
+            # else:
+            #     batch_loss["root"] = sq_err.sum() / batch_size
         else:
             batch_loss["root"] = (
                 torch.nn.MSELoss(reduction="sum")(
