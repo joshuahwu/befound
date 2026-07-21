@@ -49,7 +49,22 @@ data = prepare_batch(
     get_2d=config["model"]["is_2d"],
 )
 data_o = model(data)
+# data_o_mabe = model(data)
 
+# data_o_mabe["mu"] # latents of MABE
+# data_o_box = model(data_box) # all of box data embedded
+# mabe_nn = nearest_neighbor(data_o_mabe["mu"], data_o_box["mu"]) # gives you value in data_o_box in which data_o_box["mu"] is closest to data_o_mabe["mu"]
+
+# pose = fwd_kin_cont6d_torch(
+#         mabe_nn["x6d"],
+#         kinematic_tree,
+#         offsets.reshape((-1, n_keypts, 3)),
+#         root_pos=mabe_nn["root"].reshape(-1, 3),
+#         do_root_R=True,
+#     ).reshape(-1, window, n_keypts, 3)
+
+# dissimilarity = scipy.spatial.procrustes_by_batch(pose[...,:, keypoints_in_mabe, :2].reshape(data_len, window*n_keypts, 2), data_mabe["x2d"][..., keypoints_in_box, :].reshape(data_len, window*n_keypts, 2), dim=-1).mean()
+# assert (dissimilarity_with_lifting < dissimilarity_without_lifting)
 # pose = fwd_kin_cont6d_torch(
 #         data_o["x6d"].reshape((-1, n_keypts, 6)),
 #         kinematic_tree,
