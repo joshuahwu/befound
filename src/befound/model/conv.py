@@ -310,7 +310,7 @@ class Conv1DDecoderBlock(nn.Module):
 class Conv1DDecoder(nn.Module):
     def __init__(
         self,
-        out_channels: int,
+        out_channels: Union[int, dict],
         hidden_dim: List[int],
         latent_T: int,
         strides: Union[list, int] = 2,
@@ -343,6 +343,11 @@ class Conv1DDecoder(nn.Module):
             padding=1,
         )
 
+        if isinstance(self.out_channels, dict):
+            self.head_in_channels = hidden_dim[-1]
+        elif isinstance(self.out_channels, int):
+            self.head_in_channels = self.out_channels
+
         layers = []
         for i in range(self.n_us):
             layers.append(
@@ -361,17 +366,80 @@ class Conv1DDecoder(nn.Module):
             )
         self.backbone = nn.Sequential(*layers)
 
-        self.out = nn.Conv1d(
-            self.out_channels,
-            self.out_channels,
-            kernel_size=out_kernel_size,
-            stride=1,
-            padding=0,
-        )
+        if isinstance(self.out_channels, dict):
+            self.out = nn.ModuleDict({k: nn.Conv1d(
+                self.hidden_dim[-1],
+                self.out_channels[k],
+                kernel_size=out_kernel_size,
+                stride=1,
+                padding=0,
+            ) for k in self.out_channels.keys()})
 
-    def forward(self, x: torch.Tensor, pe_indices=None) -> torch.Tensor:
+        elif isinstance(self.out_channles, int):
+            self.out = nn.Conv1d(
+                self.out_channels,
+                self.out_channels,
+                kernel_size=out_kernel_size,
+                stride=1,
+                padding=0,
+            )
+        else:
+            raise ValueError("requires number of output channels to be set")
+        
+
+    def forward(self, x: torch.Tensor, dataset_id: torch.Tensor = None, pe_indices=None) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Forward pass for Conv1DDecoder with optional dataset-specific heads.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input latent features of shape (bs, in_channels, T)
+        dataset_id : torch.Tensor, optional
+            Dataset indices for each sample (bs,) when using dict heads.
+            Required if self.out_channels is a dict (multi-dataset mode).
+        pe_indices : optional
+            Positional encoding indices (unused)
+
+        Returns
+        -------
+        torch.Tensor or Dict[str, torch.Tensor]
+            If out_channels is int: single output tensor (bs, out_channels, T')
+            If out_channels is dict: dict[dataset_name] -> output tensor for that dataset
+        """
         bs, _, T = x.shape
         x = self.input(x)
         x = self.backbone(x)
-        x = torch.tanh(self.out(x))
-        return x
+
+        # Single output head (backward compatible)
+        if isinstance(self.out_channels, int):
+            x = torch.tanh(self.out(x))
+            return x
+
+        # Multiple dataset-specific heads - keep outputs separated by dataset
+        if isinstance(self.out_channels, dict):
+            if dataset_id is None:
+                raise ValueError("dataset_id required when using dict output heads")
+
+            # Initialize output dict for all datasets
+            output = {}
+
+            # Route each sample to its dataset's head
+            dataset_names = list(self.out_channels.keys())
+            for dataset_idx, dataset_name in enumerate(dataset_names):
+                # Find samples belonging to this dataset
+                mask = dataset_id == dataset_idx
+                if not mask.any():
+                    output[dataset_name] = torch.empty(0, device=x.device)
+                    continue
+
+                # Extract samples for this dataset
+                x_dataset = x[mask]  # (n_samples, channels, T)
+
+                # Apply dataset-specific head
+                out_dataset = torch.tanh(self.out[dataset_name](x_dataset))
+                output[dataset_name] = out_dataset
+
+            return output
+
+        raise ValueError("out_channels must be int or dict")

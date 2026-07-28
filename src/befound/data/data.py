@@ -1,7 +1,6 @@
 from neuroposelib import read
 import numpy as np
 import befound.data.quaternion as qtn
-from befound.data.constants import OFFSETS_3D, OFFSETS_3D_SUM
 from typing import Optional, Type, Union, List
 from torch.utils.data import Dataset
 import torch
@@ -14,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 import h5py
 import pandas as pd
+from befound.data.constants import OFFSETS_3D, OFFSETS_3D_SUM
 
 def inv_kin_torch(
     pose: torch.Tensor,
@@ -370,63 +370,160 @@ def get_speed_outliers(pose, threshold=2.25):
     return outlier_frames
 
 
-class MouseDataset(Dataset):
+class RodentDataset(Dataset):
     """
-    Dataset class for Mouse dataset
+    Dataset class for Rodent datasets. Supports both single and mixed multi-dataset loading.
+
+    Can be initialized with:
+    - Single dataset (dict): backward compatible mode
+    - Multiple datasets (dict[str, dict]): keys are dataset names, values are data dicts
     """
 
     def __init__(
         self,
         data,
-        arena_size=None,
         kinematic_tree=None,
         n_keypts=None,
-        label="train",
-        discrete_classes=None,
-        offsets_sum = None,
+        offsets_sum=None,
+        include_dataset_id=False,
     ):
+        """
+        Parameters
+        ----------
+        data : dict or dict[str, dict]
+            If dict: single dataset (backward compatible)
+            If dict[str, dict]: multiple datasets keyed by name
+        kinematic_tree : list or dict
+            Single dataset: kinematic tree structure
+            Multi-dataset: dict keyed by dataset name
+        n_keypts : int or dict
+            Single dataset: number of keypoints
+            Multi-dataset: dict keyed by dataset name
+        offsets_sum : float or dict
+            Single dataset: sum of offsets
+            Multi-dataset: dict keyed by dataset name
+        include_dataset_id : bool
+            If True and multi-dataset, add 'dataset_id' to samples (0, 1, 2, ...)
+        """
+        self.include_dataset_id = include_dataset_id
+
+        # Detect single vs multi-dataset mode
+        self.is_multi_dataset = False
+        if isinstance(data, dict) and len(data) > 0:
+            # Check if values are dicts (multi-dataset) or tensors (single-dataset)
+            first_val = next(iter(data.values()))
+            if isinstance(first_val, dict):
+                self.is_multi_dataset = True
+
+        if self.is_multi_dataset:
+            self._init_multi_dataset(data, kinematic_tree, n_keypts, offsets_sum)
+        else:
+            self._init_single_dataset(data, kinematic_tree, n_keypts, offsets_sum)
+
+    def _init_single_dataset(self, data, kinematic_tree, n_keypts, offsets_sum):
+        """Initialize for single dataset mode (backward compatible)"""
         self.data_keys = list(data.keys())
         self.data = data
-        self.n_keypts = n_keypts
-        self.discrete_classes = discrete_classes
-        self.offsets_sum = offsets_sum
-
-        if arena_size is not None:
-            self.arena_size = torch.tensor(arena_size)
-        else:
-            self.arena_size = None
+        self.dataset_names = None
+        self.dataset_offsets = None
+        self.discrete_classes = data.get("discrete_classes", {})
 
         self.kinematic_tree = kinematic_tree
+        self.n_keypts = n_keypts
+        self.offsets_sum = offsets_sum
 
         self.standard_offsets = False
         if "offsets" in self.data_keys:
             if self.data["offsets"].ndim == 2:
                 self.standard_offsets = True
 
-        # # List of items which have already been windowed
-        # self.ind_with_window_inds = [
-        #     k for k, v in self.data.items() if v.shape[0] != len(self.window_inds)
-        # ]
-        self.label = label
+    def _init_multi_dataset(self, datasets: dict, kinematic_tree, n_keypts, offsets_sum):
+        """Initialize for multi-dataset mode"""
+        self.dataset_names = list(datasets.keys())
+        self.datasets = datasets
+
+        # Store per-dataset metadata as dicts
+        self.kinematic_tree = kinematic_tree
+        self.n_keypts = n_keypts
+        self.offsets_sum = offsets_sum
+
+        # Find all unique keys across datasets
+        all_keys = set()
+        for d in datasets.values():
+            all_keys.update(d.keys())
+        self.data_keys = list(all_keys)
+
+        # Create offsets for indexing: [0, len(ds0), len(ds0)+len(ds1), ...]
+        self.dataset_offsets = [0]
+        for name in self.dataset_names:
+            first_key = [k for k in datasets[name].keys() if k != "discrete_classes"][0]
+            self.dataset_offsets.append(
+                self.dataset_offsets[-1] + len(datasets[name][first_key])
+            )
+
+        # Merge discrete_classes from all datasets
+        self.discrete_classes = {}
+        for name, dataset in datasets.items():
+            for key, val in dataset.get("discrete_classes", {}).items():
+                if key not in self.discrete_classes:
+                    self.discrete_classes[key] = val
+
+        # Check offsets standardness (assume same across datasets)
+        self.standard_offsets = False
+        for d in datasets.values():
+            if "offsets" in d and d["offsets"].ndim == 2:
+                self.standard_offsets = True
+                break
 
     def __len__(self):
-        return len(self.data[self.data_keys[0]])
+        if self.is_multi_dataset:
+            return self.dataset_offsets[-1]  # Total length across all datasets
+        else:
+            return len(self.data[self.data_keys[0]])
 
     def __getitem__(self, idx):
-        # Use window indices to access arrays which have not been windowed
-        # query = {
-        #     k: self.data[k][self.window_inds[idx]] for k in self.ind_with_window_inds
-        # }
-
-        # Query items which have already been windowed
+        """
+        Get a sample by global index.
+        In multi-dataset mode, maps global index to dataset and local index.
+        """
         query = {}
-        for k, v in self.data.items():
-            if (k in ["offsets"]) and self.standard_offsets:
-                query[k] = v
-            else:
-                query[k] = v[idx]
-        # query = {
-        #     k: v[idx]
-        #     for k, v in self.data.items()
-        # }
+
+        if self.is_multi_dataset:
+            # Find which dataset this index belongs to
+            dataset_idx = 0
+            for i, offset in enumerate(self.dataset_offsets[:-1]):
+                if offset <= idx < self.dataset_offsets[i + 1]:
+                    dataset_idx = i
+                    break
+
+            local_idx = idx - self.dataset_offsets[dataset_idx]
+            dataset_name = self.dataset_names[dataset_idx]
+            dataset = self.datasets[dataset_name]
+
+            # Get data from the correct dataset
+            for k in self.data_keys:
+                if k == "discrete_classes":
+                    continue
+                if k not in dataset:
+                    continue
+                v = dataset[k]
+
+                if (k in ["offsets"]) and self.standard_offsets:
+                    query[k] = v
+                else:
+                    query[k] = v[local_idx]
+
+            # Add dataset metadata if requested
+            if self.include_dataset_id:
+                query["dataset_id"] = torch.tensor(dataset_idx, dtype=torch.long)
+                query["dataset_name"] = dataset_name
+
+        else:
+            # Single dataset mode (backward compatible)
+            for k, v in self.data.items():
+                if (k in ["offsets"]) and self.standard_offsets:
+                    query[k] = v
+                else:
+                    query[k] = v[idx]
+
         return query

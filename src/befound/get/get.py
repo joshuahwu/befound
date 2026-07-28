@@ -1,13 +1,12 @@
 import re
 from pathlib import Path
 import numpy as np
-from befound.data import MouseDataset, fwd_kin_cont6d_torch, preprocess_save_data
+from befound.data import RodentDataset
 from befound.data.constants import OFFSETS_3D, OFFSETS_3D_SUM
 from torch.utils.data import DataLoader
 import h5py
 import pandas as pd
 import torch
-from torch import optim
 from typing import List, Dict, Optional
 from neuroposelib import read
 
@@ -24,16 +23,6 @@ def data_and_model(
     verbose=1,
 ):
     if use_default_val_keys:
-        if config["data"]["dataset"] == "4_mice":
-            val_data_keys = [
-                "ids",
-                "x3d",
-                "x6d",
-                "root",
-                "offsets",
-                "target_pose",
-            ]
-        else:
             val_data_keys = [
                 "ids",
                 "x3d",
@@ -54,11 +43,11 @@ def data_and_model(
     ### Load Dataset
     # if train_val_test == "all":
     loader_dict = {}
-    for is_shuffle, is_default_offsets, dataset_label in zip(shuffle, use_default_offsets, train_val_test):
-        curr_data_keys = val_data_keys if dataset_label == "val" else data_keys
-        loader_dict[dataset_label] = get_mouse_data(
+    for is_shuffle, is_default_offsets, split in zip(shuffle, use_default_offsets, train_val_test):
+        curr_data_keys = val_data_keys if split == "val" else data_keys
+        loader_dict[split] = get_rodent_data(
             data_config=config["data"],
-            train_val_test=dataset_label,
+            train_val_test=split,
             data_keys=curr_data_keys,
             shuffle=is_shuffle,
             use_default_offsets=is_default_offsets,
@@ -85,216 +74,168 @@ def all_saved_epochs(path):
     return epochs
 
 
-def get_mouse_data(
+def collate_variable_keypoints(batch: List[Dict]) -> Dict:
+    """
+    Custom collate function for batches with variable numbers of keypoints.
+
+    Handles cases where tensors have different shapes due to different keypoint counts
+    across datasets (e.g., x6d, offsets, x3d, target_pose all vary by n_keypts).
+    - Scalar metadata (dataset_id, dataset_name, ids) are stacked normally
+    - Ragged tensors (different shapes per sample) are kept as lists for set transformer
+    - Other tensors are stacked if possible, kept as lists if shapes differ
+
+    Parameters
+    ----------
+    batch : List[Dict]
+        List of samples from RodentDataset with variable keypoint counts
+
+    Returns
+    -------
+    Dict
+        Collated batch with stacked tensors and ragged lists for variable-shape data
+    """
+    collated = {}
+
+    if not batch:
+        return collated
+
+    # Get all keys from first sample
+    sample_keys = batch[0].keys()
+
+    for key in sample_keys:
+        values = [sample[key] for sample in batch]
+
+        if key in ["dataset_id"]:
+            # Stack scalars normally
+            collated[key] = torch.stack(values)
+        elif key == "dataset_name":
+            # Keep dataset names as list for reference
+            collated[key] = values
+        elif isinstance(values[0], torch.Tensor):
+            # Try to stack; if shapes differ (ragged tensors from variable keypoints), keep as list
+            try:
+                collated[key] = torch.stack(values)
+            except RuntimeError:
+                # Shapes don't match - keep as ragged list for set transformer
+                # This handles x6d, offsets, x3d, target_pose, etc. that vary by n_keypts
+                collated[key] = values
+        elif isinstance(values[0], dict):
+            # discrete_classes or other dict - keep as is
+            collated[key] = values[0]
+        else:
+            # Other types (lists, scalars, etc.)
+            collated[key] = values
+
+    return collated
+
+
+def get_rodent_data(
     data_config: dict,
     train_val_test: str = "train",
     data_keys: List[str] = ["x6d", "root", "offsets"],
     shuffle: bool = False,
-    stride: Optional[int] = None,
-    window: Optional[int] = None,
     use_default_offsets: bool = True,
 ):
     """
-    Load in mouse data and return pytorch dataloaders
+    Load in mouse data from one or multiple datasets and return pytorch dataloader.
+
+    Supports variable numbers of keypoints across datasets via custom collate function.
+    x6d tensors are kept as ragged arrays (list) to accommodate different keypoint counts.
     """
-    skeleton_config = read.config(
-        "{}mouse_skeleton.yaml".format(data_config["data_path"])
+    from befound.data.datasets import (
+        preprocess_wu_iclr25_data,
+        preprocess_pairr24m_data,
+        preprocess_mouse44_ephys_data,
+        preprocess_virtual_rodent_data,
     )
 
-    if train_val_test != "full":
-        if data_config["dataset"] == "parkinsons_healthy":
-            dataset_name = "parkinsons"
-        else:
-            dataset_name = data_config["dataset"]
-        data_path = "{}{}/{}/".format(
-            data_config["data_path"], dataset_name, train_val_test
-        )
-        if "x3d" in data_keys:
-            if "x6d" not in data_keys:
-                data_keys += ["x6d"]
-
-            if "offsets" not in data_keys:
-                data_keys += ["offsets"]
-
-            if "root" not in data_keys:
-                data_keys += ["root"]
-
-        data = {}
-        for key in data_keys + ["ids"]:
-            if key in ["pd_label", "fluorescence", "x3d"]:
-                continue
-            elif key in ["ids", "heading", "avg_speed_3d", "raw_pose"]:
-                file_path = "{}{}.h5".format(data_path, key)
-            elif key == "offsets":
-                if use_default_offsets:
-                    data["offsets"] = OFFSETS_3D
-                    print("OFFSETS SUM: {:.3f}".format(OFFSETS_3D_SUM))
-                    data["offsets"] = data["offsets"][:, None] * np.array(
-                        skeleton_config["OFFSET"], dtype=np.float32
-                    )
-                    continue
-                else:
-                    file_path = "{}{}.h5".format(data_path, key)
-            else:
-                file_path = "{}{}_{}.h5".format(
-                    data_path, key, data_config["direction_process"]
-                )
-            print("Reading in {} from {}".format(key, file_path))
-            hf = h5py.File(file_path, "r")
-            data[key] = np.array(hf.get(key))
-            hf.close()
-
-        data = {k: torch.from_numpy(v) for k, v in data.items()}
-
-
-    discrete_classes = {}
-    if data_config["dataset"] == "parkinsons":
-        # Only if read in raw poses for the PD dataset
-        # if not ((data_config["stride"] == 5) or (data_config["stride"] == 10)):
-        if "pd_label" in data_keys:
-            data["pd_label"] = torch.zeros((len(data["ids"]), 1)).long()
-            data["pd_label"][data["ids"] >= 36] = 1
-            discrete_classes["pd_label"] = torch.unique(data["pd_label"], sorted=True)
-
-        if "fluorescence" in data_keys:
-            meta = pd.read_csv(
-                data_config["data_path"] + data_config["dataset"] + "/metadata.csv"
-            )
-            # import pdb; pdb.set_trace()
-            meta_by_frame = meta.iloc[data["ids"]]
-            fluorescence = meta_by_frame["Fluorescence"].to_numpy()
-            data["fluorescence"] = torch.tensor(fluorescence, dtype=torch.float32)
-
-        data["ids"][data["ids"] >= 36] = data["ids"][data["ids"] >= 36] - 36
-        unique_ids = torch.unique(data["ids"])
-        discrete_classes["ids"] = torch.arange(len(unique_ids)).long()
+    # Handle both old single-dataset and new multi-dataset config formats
+    if "datasets" in data_config:
+        dataset_names = data_config["datasets"]
     else:
-        discrete_classes["ids"] = torch.unique(data["ids"], sorted=True)
+        raise ValueError("Config must have 'datasets' key")
 
-    dataset = MouseDataset(
-        data,
-        data_config["arena_size"],
-        skeleton_config["KINEMATIC_TREE"],
-        len(skeleton_config["LABELS"]),
-        label=train_val_test,
-        discrete_classes=discrete_classes,
-        offsets_sum=OFFSETS_3D_SUM,
+    # Map dataset names to their preprocessing functions
+    preprocess_funcs = {
+        "wu_iclr25": preprocess_wu_iclr25_data,
+        "wu_iclr25_healthy": preprocess_wu_iclr25_data,
+        "pairr24m": preprocess_pairr24m_data,
+        "mouse44_ephys": preprocess_mouse44_ephys_data,
+        "virtual_rodent": preprocess_virtual_rodent_data,
+    }
+
+    # Load data from each dataset into a dict
+    datasets_dict = {}
+    skeleton_configs = {}
+
+    for i, dataset_name in enumerate(dataset_names):
+        print(f"\nLoading dataset: {dataset_name}")
+
+        # Get the appropriate preprocessing function
+        if dataset_name == "wu_iclr25_healthy":
+            func_key = "wu_iclr25"
+            actual_dataset_name = "wu_iclr25"
+        else:
+            func_key = dataset_name
+            actual_dataset_name = dataset_name
+
+        if func_key not in preprocess_funcs:
+            raise ValueError(f"Unknown dataset: {dataset_name}. Available: {list(preprocess_funcs.keys())}")
+
+        preprocess_func = preprocess_funcs[func_key]
+
+        print("Calculating dataset: {}".format(actual_dataset_name))
+        skeleton_configs[actual_dataset_name] = read.config(
+            f"{data_config['data_path']}/{actual_dataset_name}/skeleton.yaml"
+        )
+
+        # Load dataset using appropriate preprocessing function
+        dataset_data = preprocess_func(
+            data_path=f"{data_config['data_path']}/{actual_dataset_name}/",
+            skeleton_config=skeleton_configs[actual_dataset_name],
+            window=data_config.get("window", 51),
+            train_val_test=train_val_test,
+            stride=data_config.get("stride", 10)[i],
+            data_keys=data_keys + ["ids"],
+            direction_process=data_config.get("direction_process", "midfwd"),
+            use_default_offsets=use_default_offsets,
+        )
+
+        # Store dataset with its original dataset-specific IDs (no remapping)
+        datasets_dict[actual_dataset_name] = dataset_data
+
+    # Create per-dataset metadata dicts
+    kinematic_tree_dict = {
+        name: skeleton_configs[name]["KINEMATIC_TREE"]
+        for name in dataset_names
+    }
+    n_keypts_dict = {
+        name: len(skeleton_configs[name]["LABELS"])
+        for name in dataset_names
+    }
+    offsets_sum_dict = {
+        name: OFFSETS_3D_SUM[name]
+        for name in dataset_names
+    }
+
+    # Create RodentDataset in multi-dataset mode
+    dataset = RodentDataset(
+        data=datasets_dict,
+        kinematic_tree=kinematic_tree_dict,
+        n_keypts=n_keypts_dict,
+        offsets_sum=offsets_sum_dict,
+        include_dataset_id=True,
     )
     loader = DataLoader(
         dataset=dataset,
         batch_size=data_config["batch_size"],
         shuffle=shuffle,
-        num_workers=5,
+        num_workers=0,  # Ragged tensors (list) don't serialize well across multiprocessing; CPU loads sequentially while GPU trains
         pin_memory=True,
+        collate_fn=collate_variable_keypoints,  # Custom collator for variable keypoint counts
     )
 
     return loader
-
-# def get_mouse_data(
-#     data_config: dict,
-#     train_val_test: str = "train",
-#     data_keys: List[str] = ["x6d", "root", "offsets"],
-#     shuffle: bool = False,
-#     stride: Optional[int] = None,
-#     window: Optional[int] = None,
-#     use_default_offsets: bool = True,
-# ):
-#     """
-#     Load in mouse data and return pytorch dataloaders
-#     """
-#     skeleton_config = read.config(
-#         "{}mouse_skeleton.yaml".format(data_config["data_path"])
-#     )
-
-#     if train_val_test != "full":
-#         if data_config["dataset"] == "parkinsons_healthy":
-#             dataset_name = "parkinsons"
-#         else:
-#             dataset_name = data_config["dataset"]
-#         data_path = "{}{}/{}/".format(
-#             data_config["data_path"], dataset_name, train_val_test
-#         )
-#         if "x3d" in data_keys:
-#             if "x6d" not in data_keys:
-#                 data_keys += ["x6d"]
-
-#             if "offsets" not in data_keys:
-#                 data_keys += ["offsets"]
-
-#             if "root" not in data_keys:
-#                 data_keys += ["root"]
-
-#         data = {}
-#         for key in data_keys + ["ids"]:
-#             if key in ["pd_label", "fluorescence", "x3d"]:
-#                 continue
-#             elif key in ["ids", "heading", "avg_speed_3d", "raw_pose"]:
-#                 file_path = "{}{}.h5".format(data_path, key)
-#             elif key == "offsets":
-#                 if use_default_offsets:
-#                     data["offsets"] = OFFSETS_3D
-#                     print("OFFSETS SUM: {:.3f}".format(OFFSETS_3D_SUM))
-#                     data["offsets"] = data["offsets"][:, None] * np.array(
-#                         skeleton_config["OFFSET"], dtype=np.float32
-#                     )
-#                     continue
-#                 else:
-#                     file_path = "{}{}.h5".format(data_path, key)
-#             else:
-#                 file_path = "{}{}_{}.h5".format(
-#                     data_path, key, data_config["direction_process"]
-#                 )
-#             print("Reading in {} from {}".format(key, file_path))
-#             hf = h5py.File(file_path, "r")
-#             data[key] = np.array(hf.get(key))
-#             hf.close()
-
-#         data = {k: torch.from_numpy(v) for k, v in data.items()}
-
-
-#     discrete_classes = {}
-#     if data_config["dataset"] == "parkinsons":
-#         # Only if read in raw poses for the PD dataset
-#         # if not ((data_config["stride"] == 5) or (data_config["stride"] == 10)):
-#         if "pd_label" in data_keys:
-#             data["pd_label"] = torch.zeros((len(data["ids"]), 1)).long()
-#             data["pd_label"][data["ids"] >= 36] = 1
-#             discrete_classes["pd_label"] = torch.unique(data["pd_label"], sorted=True)
-
-#         if "fluorescence" in data_keys:
-#             meta = pd.read_csv(
-#                 data_config["data_path"] + data_config["dataset"] + "/metadata.csv"
-#             )
-#             # import pdb; pdb.set_trace()
-#             meta_by_frame = meta.iloc[data["ids"]]
-#             fluorescence = meta_by_frame["Fluorescence"].to_numpy()
-#             data["fluorescence"] = torch.tensor(fluorescence, dtype=torch.float32)
-
-#         data["ids"][data["ids"] >= 36] = data["ids"][data["ids"] >= 36] - 36
-#         unique_ids = torch.unique(data["ids"])
-#         discrete_classes["ids"] = torch.arange(len(unique_ids)).long()
-#     else:
-#         discrete_classes["ids"] = torch.unique(data["ids"], sorted=True)
-
-#     dataset = MouseDataset(
-#         data,
-#         data_config["arena_size"],
-#         skeleton_config["KINEMATIC_TREE"],
-#         len(skeleton_config["LABELS"]),
-#         label=train_val_test,
-#         discrete_classes=discrete_classes,
-#         offsets_sum=OFFSETS_3D_SUM,
-#     )
-#     loader = DataLoader(
-#         dataset=dataset,
-#         batch_size=data_config["batch_size"],
-#         shuffle=shuffle,
-#         num_workers=5,
-#         pin_memory=True,
-#     )
-
-#     return loader
-
 
 def get_model(
     model_config,
