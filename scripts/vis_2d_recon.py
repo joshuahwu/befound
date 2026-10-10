@@ -24,7 +24,7 @@ loader_dict, model = befound.get.data_and_model(
     use_default_offsets=[True, False],
 )
 loader = loader_dict["val"]
-offsets_sum = loader.dataset.offsets_sum
+body_scale = loader.dataset.body_scale
 window = config["model"]["window"]
 n_keypts = loader.dataset.n_keypts
 kinematic_tree = loader.dataset.kinematic_tree
@@ -43,7 +43,7 @@ data = loader.dataset[sample_inds]
 data = prepare_batch(
     data=data,
     augment_dict=augment_dict,
-    offsets_sum=offsets_sum,
+    body_scale=body_scale,
     kinematic_tree=kinematic_tree,
     device="cuda",
     get_2d=config["model"]["is_2d"],
@@ -76,7 +76,7 @@ data_o = model(data)
 pose = np.zeros((*data_o["x2d"].shape[:-1], 3)) + 0.01
 pose[..., :2] = data_o["x2d"].cpu().detach().numpy()
 vis.pose.arena3D(
-    pose.reshape(-1, n_keypts, 3) * offsets_sum,
+    pose.reshape(-1, n_keypts, 3) * body_scale,
     connectivity,
     frames=[0],
     centered=False,
@@ -89,7 +89,7 @@ vis.pose.arena3D(
 pose = np.zeros((*data["x2d"].shape[:-1], 3)) + 0.01
 pose[..., :2] = data["x2d"].cpu().detach().numpy()
 vis.pose.arena3D(
-    pose.reshape(-1, n_keypts, 3) * offsets_sum,
+    pose.reshape(-1, n_keypts, 3) * body_scale,
     connectivity,
     frames=[0],
     centered=False,
@@ -102,7 +102,7 @@ vis.pose.arena3D(
 pose = np.zeros((*data["target_pose"].shape[:-1], 3)) + 0.01
 pose[..., :2] = data["target_pose"][..., :2].cpu().detach().numpy()
 vis.pose.arena3D(
-    pose.reshape(-1, n_keypts, 3) * offsets_sum,
+    pose.reshape(-1, n_keypts, 3) * body_scale,
     connectivity,
     frames=[0],
     centered=False,

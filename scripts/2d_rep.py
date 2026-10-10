@@ -41,7 +41,7 @@ for analysis_key, (load_epoch, dim_key) in key_dict.items():
                     use_default_offsets=[True],
                 )
             loader = loader_dict["val"]
-            offsets_sum = loader.dataset.offsets_sum
+            body_scale = loader.dataset.body_scale
             kinematic_tree = loader.dataset.kinematic_tree
 
             if (dim_k == "2d") and ("vae_2d" not in analysis_key):
@@ -68,7 +68,7 @@ for analysis_key, (load_epoch, dim_key) in key_dict.items():
                     data = prepare_batch(
                         data=data,
                         augment_dict=augment_dict,
-                        offsets_sum=offsets_sum,
+                        body_scale=body_scale,
                         kinematic_tree=kinematic_tree,
                         device="cuda",
                         get_2d=config["model"]["is_2d"],

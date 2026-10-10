@@ -42,13 +42,22 @@ run = wandb.init(
 )
 print("WANDB directory: {}".format(run.dir))
 
+# if config["data"]["is_pretraining"]:
+#     train_val_test = ["full"]
+# else:
+train_val_test = ["train", "val"]
+
 # Get DataLoaders and model
 loader_dict, model = befound.get.data_and_model(
     config,
-    train_val_test=["train", "val"],
-    data_keys=["x6d", "root", "offsets", "target_pose"],
-    shuffle=[True, False],
-    use_default_offsets=[True, False],
+    train_val_test=train_val_test,
+    # data_keys=["x6d", "root", "offsets", "target_pose"],
+    shuffle=[True, True],
+    # use_default_offsets=[True, False],
+    # demo=False,
+    # from_h5=True,
+    balanced_sampling=True,
+    use_all_test_val_data=len(config["data"]["datasets"]) > 1,
 )
 
 # Train model

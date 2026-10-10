@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 import torch
 from numpy.lib.stride_tricks import sliding_window_view
 from tqdm import trange
+import tqdm
 import numpy as np
 from typing import List
 import torch
@@ -24,6 +25,7 @@ from befound.data.data import (
 )
 from pathlib import Path
 import h5py
+
 
 def _preprocess_pose_to_features(
     pose,
@@ -142,7 +144,6 @@ def _preprocess_pose_to_features(
             eps=1e-8,
         ).reshape(data["x6d"].shape[:-1] + (3,))
 
-
     return data
 
 
@@ -153,6 +154,7 @@ def preprocess_wu_iclr25_data(
     data_keys: List[str] = ["x6d", "root", "offsets"],
     direction_process: str = "midfwd",
     use_default_offsets: bool = False,
+    demo: bool = False,
     **kwargs,
 ):
     """Load pre-calculated features from wu_iclr25 datasets.
@@ -196,6 +198,7 @@ def preprocess_wu_iclr25_data(
         if "root" not in data_keys:
             data_keys = list(data_keys) + ["root"]
 
+    print("Calculating dataset: WU_ICLR25")
     # Load pre-calculated features from H5 files
     data = {}
     for key in data_keys:
@@ -221,9 +224,20 @@ def preprocess_wu_iclr25_data(
         hf.close()
 
     # Convert to torch tensors
-    data = {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in data.items()}
+    data = {
+        k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+        for k, v in data.items()
+    }
 
     data_len = len(data[list(data.keys())[0]])
+    print("wu_iclr25 Data Length: {}".format(data_len))
+    import pdb
+
+    pdb.set_trace()
+
+    if demo:
+        data = {k: v[:20000, ...] for k, v in data.items()}
+
     ids = data["ids"].numpy() if isinstance(data["ids"], torch.Tensor) else data["ids"]
 
     # Get animal IDs
@@ -257,7 +271,9 @@ def preprocess_wu_iclr25_data(
         if k == "discrete_classes":
             continue
         try:
-            assert len(v) == data_len, f"Length mismatch for {k}: {len(v)} != {data_len}"
+            assert (
+                len(v) == data_len
+            ), f"Length mismatch for {k}: {len(v)} != {data_len}"
         except AssertionError as e:
             # offsets can have a different first dimension (n_keypoints,)
             if k == "offsets" and len(v.shape) == 2:
@@ -303,7 +319,6 @@ def preprocess_pairr24m_data(
     data
         Dictionary with key-value pairs associated with `data_keys`
     """
-
     meta = pd.read_csv(data_path + "metadata.csv")
 
     labels_list = [
@@ -317,55 +332,65 @@ def preprocess_pairr24m_data(
     ]
     pose_a1, ids = read.pose_h5(data_path + "pose_a1.h5")
     pose_a2, _ = read.pose_h5(data_path + "pose_a2.h5")
-    split_inds = np.load(data_path + "{}_inds.npy".format(train_val_test))
     pose_a1 = pose_a1.astype(np.float32)
     pose_a2 = pose_a2.astype(np.float32)
-    split_inds = split_inds.astype(np.int32)
     ids = ids.astype(np.int16)
 
-    curr_id = 0
-    split_ids = []
-    for i in np.unique(ids):
-        split_inds_i = split_inds[ids[split_inds] == i]
-        n_consecutive = np.where(
-            np.diff(split_inds_i, prepend=split_inds_i[0] - 1) != 1
-        )[0]
-        n_consecutive = np.diff(n_consecutive, prepend=0, append=len(split_inds_i))
-        split_ids += [np.repeat(np.arange(len(n_consecutive)) + curr_id, n_consecutive)]
-        curr_id += len(n_consecutive)
+    if train_val_test in [None, "full"]:
+        window_inds = get_window_indices(ids, stride, window=window)
+        pose_a1 = pose_a1[window_inds, ...].astype(np.float32)
+        pose_a2 = pose_a2[window_inds, ...].astype(np.float32)
+        ids = ids[window_inds][:, window // 2]
+    else:
+        split_inds = np.load(data_path + "{}_inds.npy".format(train_val_test))
+        split_inds = split_inds.astype(np.int32)
 
-    split_ids = np.concatenate(split_ids)
-    # labels_dict = {k: [] for k in labels_list}
-    # for i, f_path in enumerate(meta["FolderPath"]):
-    #     markers_csv = pd.read_csv(data_path + f_path + "/markerDataset.csv")
-    #     # for label in labels_list:
-    #     #     labels_dict[label].append(markers[label].to_numpy())
-    # labels_dict = {
-    #     k: torch.from_numpy(np.concatenate(v, axis=0)) for k, v in labels_dict.items()
-    # }
+        curr_id = 0
+        split_ids = []
+        for i in np.unique(ids):
+            split_inds_i = split_inds[ids[split_inds] == i]
+            n_consecutive = np.where(
+                np.diff(split_inds_i, prepend=split_inds_i[0] - 1) != 1
+            )[0]
+            n_consecutive = np.diff(n_consecutive, prepend=0, append=len(split_inds_i))
+            split_ids += [
+                np.repeat(np.arange(len(n_consecutive)) + curr_id, n_consecutive)
+            ]
+            curr_id += len(n_consecutive)
 
-    # for label in ["goodFrame", "behaviorFine", "behaviorCoarse"]:
-    #     snake_case = re.sub(r"(?<!^)(?=[A-Z])", "_", label).lower()
-    #     if snake_case in data_keys:
-    #         labels_dict[re.sub(r"(?<!^)(?=[A-Z])", "_", label).lower()] = torch.vstack(
-    #             (labels_dict[label + "_an1"], labels_dict[label + "_an2"])
-    #         )
-    #         del labels_dict[label + "_an1"]
-    #         del labels_dict[label + "_an2"]
+        split_ids = np.concatenate(split_ids)
 
-    window_inds = get_window_indices(split_ids, stride, window)
+        # labels_dict = {k: [] for k in labels_list}
+        # for i, f_path in enumerate(meta["FolderPath"]):
+        #     markers_csv = pd.read_csv(data_path + f_path + "/markerDataset.csv")
+        #     # for label in labels_list:
+        #     #     labels_dict[label].append(markers[label].to_numpy())
+        # labels_dict = {
+        #     k: torch.from_numpy(np.concatenate(v, axis=0)) for k, v in labels_dict.items()
+        # }
 
-    if demo:
-        window_inds = np.concatenate(
-            [
-                window_inds[:20000, ...],
-                window_inds[len(window_inds) // 2 : len(window_inds) // 2 + 20000],
-            ],
-            axis=0,
-        )
-    ids = ids[split_inds[window_inds]][:, window // 2]
-    pose_a1 = pose_a1[split_inds[window_inds]]
-    pose_a2 = pose_a2[split_inds[window_inds]]
+        # for label in ["goodFrame", "behaviorFine", "behaviorCoarse"]:
+        #     snake_case = re.sub(r"(?<!^)(?=[A-Z])", "_", label).lower()
+        #     if snake_case in data_keys:
+        #         labels_dict[re.sub(r"(?<!^)(?=[A-Z])", "_", label).lower()] = torch.vstack(
+        #             (labels_dict[label + "_an1"], labels_dict[label + "_an2"])
+        #         )
+        #         del labels_dict[label + "_an1"]
+        #         del labels_dict[label + "_an2"]
+
+        window_inds = get_window_indices(split_ids, stride, window)
+
+        # if demo:
+        #     window_inds = np.concatenate(
+        #         [
+        #             window_inds[:20000, ...],
+        #             window_inds[len(window_inds) // 2 : len(window_inds) // 2 + 20000],
+        #         ],
+        #         axis=0,
+        #     )
+        ids = ids[split_inds[window_inds]][:, window // 2]
+        pose_a1 = pose_a1[split_inds[window_inds]]
+        pose_a2 = pose_a2[split_inds[window_inds]]
 
     # pose = pose[window_inds, ...].astype(np.float32)
     # ids = ids[window_inds][:, window // 2]
@@ -379,6 +404,18 @@ def preprocess_pairr24m_data(
     ids = np.delete(ids, nan_frames, axis=0)
 
     data_len = len(pose)
+    print("Calculating dataset: PairR24M")
+    print("PairR24M Data Length: {}".format(data_len))
+
+    if demo:
+        print("Using demo mode")
+        pose = np.concatenate(
+            [pose[:10000, ...], pose[len(pose) // 2 : len(pose) // 2 + 10000]], axis=0
+        )
+        ids = np.concatenate(
+            [ids[:10000, ...], ids[len(ids) // 2 : len(ids) // 2 + 10000]], axis=0
+        )
+
     data = {}  # "raw_pose": pose}
 
     # Compute pose features (yaw, heading, x6d, offsets, root, target_pose)
@@ -419,6 +456,7 @@ def preprocess_mouse44_ephys_data(
     data_keys: List[str] = ["x6d", "root", "offsets"],
     direction_process: str = "midfwd",
     use_default_offsets: bool = False,
+    demo: bool = False,
     **kwargs,
 ):
     """
@@ -445,25 +483,47 @@ def preprocess_mouse44_ephys_data(
         Torch tensors for all requested data_keys
     """
 
+    if "x3d" in data_keys:
+        if "x6d" not in data_keys:
+            data_keys = list(data_keys) + ["x6d"]
+        if "offsets" not in data_keys:
+            data_keys = list(data_keys) + ["offsets"]
+        if "root" not in data_keys:
+            data_keys = list(data_keys) + ["root"]
     # Load all .mat files
     pose, ids = read.pose_h5(data_path + "pose.h5")  # (n_samples, n_keypoints, 3)
 
-    # Load split indices
-    if train_val_test == "train":
-        inds = np.load(data_path + "train_inds.npy")
-    elif train_val_test == "val":
-        inds = np.load(data_path + "val_inds.npy")
-    elif train_val_test == "test":
-        inds = np.load(data_path + "test_inds.npy")
-    else:
-        raise ValueError(f"Unknown split: {train_val_test}")
+    if train_val_test in [None, "full"]:
+        window = kwargs["window"] if "window" in kwargs else 51
+        window_inds = get_window_indices(ids, stride, window=window)
 
-    # Index windowed pose
-    window = inds.shape[-1]
-    pose = pose[inds[::stride]]  # (n_samples, window, n_keypoints, 3)
-    ids = ids[inds[::stride, window//2]]
+        pose = pose[window_inds, ...].astype(np.float32)
+        ids = ids[window_inds][:, window // 2]
+    else:
+        # Load split indices
+        if train_val_test == "train":
+            inds = np.load(data_path + "train_inds.npy")
+        elif train_val_test == "val":
+            inds = np.load(data_path + "val_inds.npy")
+        elif train_val_test == "test":
+            inds = np.load(data_path + "test_inds.npy")
+        else:
+            raise ValueError(f"Unknown split: {train_val_test}")
+
+        # Index windowed pose
+        window = inds.shape[-1]
+
+        pose = pose[inds[::stride]]  # (n_samples, window, n_keypoints, 3)
+        ids = ids[inds[::stride, window // 2]]
 
     data_len = len(pose)
+    print("Calculating dataset: Mouse44 Ephys")
+    print("Mouse 44 Data Length: {}".format(data_len))
+
+    if demo:
+        print("Using demo mode")
+        pose = pose[:20000, ...]
+        ids = ids[:20000]
     data = {}
 
     # Compute features
@@ -493,8 +553,284 @@ def preprocess_mouse44_ephys_data(
     return data
 
 
+def preprocess_virtual_rodent_data(
+    data_path: str,
+    skeleton_config: dict,
+    train_val_test: str = "train",
+    stride: int = 1,
+    data_keys: List[str] = ["x6d", "root", "offsets"],
+    direction_process: str = "midfwd",
+    use_default_offsets: bool = False,
+    demo: bool = False,
+    **kwargs,
+):
+    """
+    Load and preprocess virtual rodent dataset using pre-computed train/val/test splits.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to folder with .mat files
+    skeleton_config : dict
+        Skeleton config with KINEMATIC_TREE and OFFSET
+    train_val_test : str
+        Which split ("train", "val", "test")
+    data_keys : List[str]
+        Features to compute (x6d, root, offsets, heading, etc.)
+    direction_process : str
+        "midfwd" or "x360"
+    use_default_offsets : bool
+        Use pre-computed default offsets
+
+    Returns
+    -------
+    data : dict
+        Torch tensors for all requested data_keys
+    """
+
+    if "x3d" in data_keys:
+        if "x6d" not in data_keys:
+            data_keys = list(data_keys) + ["x6d"]
+        if "offsets" not in data_keys:
+            data_keys = list(data_keys) + ["offsets"]
+        if "root" not in data_keys:
+            data_keys = list(data_keys) + ["root"]
+    # Load all .mat files
+    pose, ids = read.pose_h5(data_path + "pose.h5")  # (n_samples, n_keypoints, 3)
+
+    if train_val_test in [None, "full"]:
+        window = kwargs["window"] if "window" in kwargs else 51
+        window_inds = get_window_indices(ids, stride, window=window)
+        pose = pose[window_inds, ...].astype(np.float32)
+        ids = ids[window_inds][:, window // 2]
+    else:
+        # Load split indices
+        if train_val_test == "train":
+            inds = np.load(data_path + "train_inds.npy")
+        elif train_val_test == "val":
+            inds = np.load(data_path + "val_inds.npy")
+        elif train_val_test == "test":
+            inds = np.load(data_path + "test_inds.npy")
+        else:
+            raise ValueError(f"Unknown split: {train_val_test}")
+
+        # Index windowed pose
+        window = inds.shape[-1]
+
+        pose = pose[inds[::stride]]  # (n_samples, window, n_keypoints, 3)
+        ids = ids[inds[::stride, window // 2]]
+
+    data_len = len(pose)
+    print("Calculating dataset: Virtual Rodent")
+    print("Virtual Rodent Data Length: {}".format(data_len))
+
+    if demo:
+        print("Using demo mode")
+        pose = pose[:20000, ...]
+        ids = ids[:20000]
+    data = {}
+
+    # Compute features
+    features = _preprocess_pose_to_features(
+        pose,
+        skeleton_config=skeleton_config,
+        data_keys=data_keys,
+        direction_process=direction_process,
+        use_default_offsets=use_default_offsets,
+        offsets_default=OFFSETS_3D["mouse44_ephys"] if use_default_offsets else None,
+    )
+    data.update(features)
+    # Get animal IDs
+    if "ids" in data_keys:
+        data["ids"] = torch.tensor(ids, dtype=torch.int16)
+
+    ## TODO:
+    # import pdb; pdb.set_trace()
+    # samples = [50000, 2000, 124058]
+    # vis.pose.grid3D(data["target_pose"][samples].numpy().reshape(-1, 44, 3), connectivity, frames = np.arange(len(samples))*51, centered=False, fps=35, N_FRAMES=51, VID_NAME="test.mp4", SAVE_ROOT="./")
+
+    # Validate all outputs have same length
+    for k, v in data.items():
+        try:
+            assert len(v) == data_len
+        except:
+            assert (len(v) == pose.shape[-2]) and (k == "offsets")
+
+    return data
+
+
+def preprocess_sdannce_data(
+    data_path: str,
+    skeleton_config: dict,
+    train_val_test: str = "train",
+    stride: int = 1,
+    data_keys: List[str] = ["x6d", "root", "offsets"],
+    direction_process: str = "midfwd",
+    use_default_offsets: bool = False,
+    demo: bool = False,
+    **kwargs,
+):
+    """
+    Load and preprocess SDANNCE dataset using pre-computed train/val/test splits.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to folder with .mat files
+    skeleton_config : dict
+        Skeleton config with KINEMATIC_TREE and OFFSET
+    train_val_test : str
+        Which split ("train", "val", "test")
+    data_keys : List[str]
+        Features to compute (x6d, root, offsets, heading, etc.)
+    direction_process : str
+        "midfwd" or "x360"
+    use_default_offsets : bool
+        Use pre-computed default offsets
+
+    Returns
+    -------
+    data : dict
+        Torch tensors for all requested data_keys
+    """
+
+    if "x3d" in data_keys:
+        if "x6d" not in data_keys:
+            data_keys = list(data_keys) + ["x6d"]
+        if "offsets" not in data_keys:
+            data_keys = list(data_keys) + ["offsets"]
+        if "root" not in data_keys:
+            data_keys = list(data_keys) + ["root"]
+    # Load all .mat files
+    pose_a1, ids_a1 = read.pose_h5(
+        data_path + "pose_a1.h5"
+    )  # (n_samples, n_keypoints, 3)
+    pose_a2, ids_a2 = read.pose_h5(
+        data_path + "pose_a2.h5"
+    )  # (n_samples, n_keypoints, 3)
+    pose_a1 = pose_a1.astype(np.float32)
+    pose_a2 = pose_a2.astype(np.float32)
+    ids_a1 = ids_a1.astype(np.int16)
+    ids_a2 = ids_a2.astype(np.int16)
+
+    if train_val_test in [None, "full"]:
+        window = kwargs["window"] if "window" in kwargs else 51
+        window_inds_a1 = get_window_indices(ids_a1, stride, window=window)
+        window_inds_a2 = get_window_indices(ids_a2, stride, window=window)
+        pose_a1 = pose_a1[window_inds_a1, ...].astype(np.float32)
+        pose_a2 = pose_a2[window_inds_a2, ...].astype(np.float32)
+        ids_a1 = ids_a1[window_inds_a1][:, window // 2]
+        ids_a2 = ids_a2[window_inds_a2][:, window // 2]
+    else:
+        # Load split indices
+        if train_val_test == "train":
+            inds = np.load(data_path + "train_inds.npy")
+        elif train_val_test == "val":
+            inds = np.load(data_path + "val_inds.npy")
+        elif train_val_test == "test":
+            inds = np.load(data_path + "test_inds.npy")
+        else:
+            raise ValueError(f"Unknown split: {train_val_test}")
+
+        # Index windowed pose
+        window = inds.shape[-1]
+
+        pose_a1 = pose_a1[inds[::stride]]  # (n_samples, window, n_keypoints, 3)
+        pose_a2 = pose_a2[inds[::stride]]  # (n_samples, window, n_keypoints, 3)
+        ids_a1 = ids_a1[inds[::stride, window // 2]]
+        ids_a2 = ids_a2[inds[::stride, window // 2]]
+
+    import pdb
+
+    pdb.set_trace()
+    if demo:
+        print("Using demo mode")
+        pose = pose_a1[:20000, ...]
+        ids = ids_a1[:20000]
+    else:
+        pose = np.concatenate([pose_a1, pose_a2], axis=0)
+        ids = np.concatenate([ids_a1, ids_a2 + ids_a1.max() + 1])
+
+    data_len = len(pose_a1) + len(pose_a2)
+    print("Calculating dataset: SDANNCE")
+    print("SDANNCE Data Length: {}".format(data_len))
+    data = {}
+
+    # Compute features
+    features = _preprocess_pose_to_features(
+        pose,
+        skeleton_config=skeleton_config,
+        data_keys=data_keys,
+        direction_process=direction_process,
+        use_default_offsets=use_default_offsets,
+        offsets_default=OFFSETS_3D["mouse44_ephys"] if use_default_offsets else None,
+    )
+    data.update(features)
+    # Get animal IDs
+    if "ids" in data_keys:
+        data["ids"] = torch.tensor(ids, dtype=torch.int16)
+
+    ## TODO:
+    # import pdb; pdb.set_trace()
+    # samples = [50000, 2000, 124058]
+    # vis.pose.grid3D(data["target_pose"][samples].numpy().reshape(-1, 44, 3), connectivity, frames = np.arange(len(samples))*51, centered=False, fps=35, N_FRAMES=51, VID_NAME="test.mp4", SAVE_ROOT="./")
+
+    # Validate all outputs have same length
+    for k, v in data.items():
+        try:
+            assert len(v) == data_len
+        except:
+            assert (len(v) == pose.shape[-2]) and (k == "offsets")
+
+    return data
+
+
+def _has_any_nan(pose_dataset, chunk_size=1_000_000):
+    """Cheaply check whether an h5py pose Dataset contains any NaNs, reading it
+    in sequential chunks (fast contiguous reads) and stopping at the first hit,
+    rather than the random-access fancy indexing _drop_nan_windows needs.
+    """
+    n_frames = pose_dataset.shape[0]
+    for start in range(0, n_frames, chunk_size):
+        end = min(start + chunk_size, n_frames)
+        if np.isnan(pose_dataset[start:end]).any():
+            return True
+    return False
+
+
+def _drop_nan_windows(pose_dataset, inds, batch_size=50_000):
+    """Drop any window (row of `inds`) that touches a NaN anywhere in its span.
+
+    `pose_dataset` is an open h5py Dataset of shape (n_frames, n_keypoints, dim).
+    Processed `batch_size` windows at a time so memory stays bounded regardless
+    of how many windows there are or how large each window is -- expanding
+    every window at once (the previous behavior) needs
+    len(inds) * window_size * n_keypoints * dim floats live simultaneously,
+    which for a large dataset with a big window (e.g. mouse_ephys: tens of
+    millions of ~200-frame windows) is a multi-terabyte allocation and OOMs
+    even on a 1TB node. Each batch still only reads the unique frames it
+    touches from disk (same trick, just scoped to the batch).
+    """
+    if len(inds) == 0:
+        return inds
+
+    keep = np.zeros(len(inds), dtype=bool)
+    for start in range(0, len(inds), batch_size):
+        end = start + batch_size
+        batch = inds[start:end]
+        flat_inds = batch.reshape(-1)
+        unique_inds, inverse = np.unique(flat_inds, return_inverse=True)
+        pose_windows = pose_dataset[unique_inds][inverse].reshape(
+            batch.shape + pose_dataset.shape[1:]
+        )
+        has_nan = np.isnan(pose_windows).reshape(len(batch), -1).any(axis=1)
+        keep[start:end] = ~has_nan
+
+    return inds[keep]
+
+
 def train_val_test_split(
-    pose_dict,
+    pose_h5_path,
     window=51,
     stride=10,
     block_size=6000,
@@ -502,22 +838,22 @@ def train_val_test_split(
     val_frac=0.25,
     test_frac=0.25,
     seed=0,
-    save_dir=None,
     gap=25,
-    pose_h5_path=None,
+    force_train_ids=None,
 ):
-
     """
     Split multi-session pose data into train/val/test by temporal blocks.
 
-    Each session is chopped into fixed-size blocks, and whole blocks are randomly
-    assigned to splits. Windows straddling block boundaries are dropped to prevent
-    temporal leakage.
+    Each session (a contiguous run of one value in the h5's "ids" dataset) is
+    chopped into fixed-size blocks, and whole blocks are randomly assigned to
+    splits. Windows straddling block boundaries are dropped to prevent temporal
+    leakage.
 
     Parameters
     ----------
-    pose_dict : dict[str, np.ndarray]
-        Maps session name -> pose array of shape (n_frames, n_keypoints, 3).
+    pose_h5_path : str or Path
+        Path to an existing pose .h5 file (as loaded by RodentDiskDataset),
+        containing "pose" (n_frames, n_keypoints, 3) and per-frame "ids".
     window, stride : int
         Sliding window length / step.
     block_size : int
@@ -526,71 +862,94 @@ def train_val_test_split(
         Fraction of each session's blocks assigned to each split. Must sum to 1.
     seed : int
         RNG seed for reproducible block assignment.
-    save_dir : str or Path, optional
-        If given, saves train_inds.npy / val_inds.npy / test_inds.npy and metadata.csv here.
-    pose_h5_path : str or Path, optional
-        If given, writes the full concatenated pose plus per-frame session ids here.
+    gap : int
+        Minimum frame margin kept between a window and its block boundary.
+    force_train_ids : set, optional
+        Session ids (h5 "ids" values) to keep 100% train -- every kept window
+        for these sessions goes straight to train_inds, skipping the random
+        block split entirely (e.g. virtual_rodent's espie, which should never
+        appear in val/test).
 
     Returns
     -------
-    pose_full : np.ndarray
-        Concatenated pose array (total_frames, n_keypoints, 3).
     train_inds, val_inds, test_inds : np.ndarray
         Window indices for each split (n_windows, window).
-    metadata : pd.DataFrame
-        Session metadata with path, name, session_offset, session_length.
-        Index is session id (matches the ids array).
     """
+    force_train_ids = force_train_ids or set()
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-8
 
-    session_names = list(pose_dict.keys())
-    session_lengths = [pose_dict[s].shape[0] for s in session_names]
-    session_offsets = np.concatenate([[0], np.cumsum(session_lengths)])[:-1]
+    # Read only "ids" (not the full pose array, which can be tens of millions of
+    # frames) to recover per-session frame ranges.
+    with h5py.File(pose_h5_path, "r") as hf:
+        ids = np.asarray(hf["ids"])
 
-    pose_full = np.concatenate([pose_dict[s] for s in session_names], axis=0)
-    ids = np.concatenate([np.full(n, i) for i, n in enumerate(session_lengths)])
+    unique_ids, first_idx, session_lengths = np.unique(
+        ids, return_index=True, return_counts=True
+    )
+    order = np.argsort(first_idx)
+    session_ids = unique_ids[order]
+    session_offsets = first_idx[order]
+    session_lengths = session_lengths[order]
 
-    if pose_h5_path is None and save_dir is not None:
-        pose_h5_path = Path(save_dir) / "pose.h5"
-    if pose_h5_path is not None:
-        Path(pose_h5_path).parent.mkdir(parents=True, exist_ok=True)
-        write.pose_h5(pose_full, ids, str(pose_h5_path))
+    # Each session's frames must be contiguous in the h5 (how these files are built).
+    expected_next_offset = np.concatenate([session_offsets[1:], [len(ids)]])
+    assert np.array_equal(
+        session_offsets + session_lengths, expected_next_offset
+    ), "ids in {} are not grouped into contiguous per-session runs".format(pose_h5_path)
 
     rng = np.random.default_rng(seed)
 
     train_inds, val_inds, test_inds = [], [], []
-    for i, n in enumerate(session_lengths):
+    n_blocks = 0
+    for i, n in enumerate(tqdm.tqdm(session_lengths)):
         if n < window:
-            print(f"Skipping {session_names[i]}: length {n} < window {window}")
+            print(f"Skipping session {session_ids[i]}: length {n} < window {window}")
             continue
 
         start = session_offsets[i]
         frame_idx = np.arange(start, start + n)
         session_windows = sliding_window_view(frame_idx, window)[::stride]
 
+        if session_ids[i] in force_train_ids:
+            # Skip the random block split entirely -- every kept window in
+            # this session goes to train.
+            train_inds.append(session_windows)
+            continue
+
         # Assign each window to a block by its start frame, then keep only windows whose
         # entire span (including a `gap`-frame margin on both ends) stays inside that
         # one block — this both prevents straddling a block boundary AND guarantees a
         # minimum gap between windows in blocks that end up in different splits.
         block_id = (session_windows[:, 0] - start) // block_size
+        assert (block_id==np.max(block_id)).sum() >= gap + 1
+        n_blocks += np.max(block_id) + 1
         block_start = start + block_id * block_size
         block_end = np.minimum(block_start + block_size, start + n)
 
-        margin_start = session_windows[:, 0] - block_start
         margin_end = block_end - session_windows[:, -1] - 1
-        keep = (margin_end >= gap) # & (margin_start >= 0)
+        keep = margin_end >= gap  # & (margin_start >= 0)
 
         session_windows = session_windows[keep]
         block_id = block_id[keep]
 
         blocks = rng.permutation(np.unique(block_id))
 
-        n_train = int(np.floor(len(blocks) * train_frac))
-        n_val = int(np.floor(len(blocks) * val_frac))
+        if len(blocks) == 1:
+            # floor(1 * train_frac) and floor(1 * val_frac) both round down to
+            # 0, so a single-block session would otherwise fall through to
+            # test_blocks deterministically (not by chance -- rng.permutation
+            # of a 1-element array is a no-op) regardless of train/val/test
+            # fracs. Put it entirely in train instead, same as force_train_ids.
+            train_blocks = blocks
+            val_blocks = blocks[:0]
+            test_blocks = blocks[:0]
+        else:
+            n_train = int(np.floor(len(blocks) * train_frac))
+            n_val = int(np.floor(len(blocks) * val_frac))
 
-        train_blocks = blocks[:n_train]
-        val_blocks = blocks[n_train : n_train + n_val]
-        test_blocks = blocks[n_train + n_val :]
+            train_blocks = blocks[:n_train]
+            val_blocks = blocks[n_train : n_train + n_val]
+            test_blocks = blocks[n_train + n_val :]
 
         train_inds.append(session_windows[np.isin(block_id, train_blocks)])
         val_inds.append(session_windows[np.isin(block_id, val_blocks)])
@@ -607,123 +966,33 @@ def train_val_test_split(
     assert len(np.intersect1d(train_inds.flatten(), val_inds.flatten())) == 0
     assert len(np.intersect1d(train_inds.flatten(), test_inds.flatten())) == 0
     assert len(np.intersect1d(val_inds.flatten(), test_inds.flatten())) == 0
+    assert sum([len(np.unique(split_inds)) for split_inds in [train_inds, test_inds, val_inds]]) == (len(ids) - n_blocks*gap)
 
-    # Create metadata DataFrame indexed by session id
-    metadata = pd.DataFrame({
-        'session_name': session_names,
-        'session_offset': session_offsets,
-        'session_length': session_lengths,
-    })
-    metadata.index.name = 'ids'
-
-    if save_dir is not None:
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        np.save(save_dir / "train_inds.npy", train_inds)
-        np.save(save_dir / "val_inds.npy", val_inds)
-        np.save(save_dir / "test_inds.npy", test_inds)
-        metadata.to_csv(save_dir / "meta.csv")
-
-    return pose_full, train_inds, val_inds, test_inds, metadata
-
-
-def preprocess_virtual_rodent_data(
-    data_path: str,
-    skeleton_config: dict,
-    window: int,
-    train_val_test: str = "train",
-    stride: int = 1,
-    data_keys: List[str] = ["x6d", "root", "offsets"],
-    direction_process: str = "midfwd",
-    use_default_offsets: bool = False,
-    **kwargs,
-):
-    """Load and preprocess virtual_rodent data.
-
-    Loads concatenated pose from pose.h5, extracts windows using precomputed split indices,
-    and computes x6d, offsets, root, and other features.
-
-    Parameters
-    ----------
-    data_path : str
-        Path to virtual_rodent directory
-    skeleton_config : dict
-        Skeleton configuration (KINEMATIC_TREE, OFFSET, LABELS)
-    window : int
-        Sliding window size
-    train_val_test : str
-        Which split ("train", "val", "test")
-    stride : int
-        Stride (informational, actual stride is in precomputed indices)
-    data_keys : List[str]
-        Features to compute (x6d, root, offsets, etc.)
-    direction_process : str
-        Direction processing mode ("midfwd" or "x360")
-    use_default_offsets : bool
-        Whether to use default offsets from constants
-
-    Returns
-    -------
-    data : dict
-        Dictionary with torch tensors for all requested data_keys
-    """
-    # Handle x3d which requires additional keys
-    if "x3d" in data_keys:
-        if "x6d" not in data_keys:
-            data_keys = list(data_keys) + ["x6d"]
-        if "offsets" not in data_keys:
-            data_keys = list(data_keys) + ["offsets"]
-        if "root" not in data_keys:
-            data_keys = list(data_keys) + ["root"]
-
-    data_path = Path(data_path)
-
-    # Load full concatenated pose
-    pose_full, ids = read.pose_h5(str(data_path / "pose.h5"))
-    pose_full = pose_full.astype(np.float32)
-    ids = ids.astype(np.int16)
-
-    # Load precomputed split indices (n_windows, window_size)
-    split_inds = np.load(data_path / f"{train_val_test}_inds.npy").astype(np.int32)
-
-    # Extract windowed pose data: (n_windows, window, n_keypts, 3)
-    pose = pose_full[split_inds]
-    ids_split = ids[split_inds[:, window // 2]]  # IDs at center of each window
-
-    data_len = len(pose)
-    data = {}
-
-    # Compute pose features (yaw, heading, x6d, offsets, root, target_pose)
-    features = _preprocess_pose_to_features(
-        pose,
-        skeleton_config=skeleton_config,
-        data_keys=data_keys,
-        direction_process=direction_process,
-        use_default_offsets=use_default_offsets,
-        offsets_default=OFFSETS_3D.get("virtual_rodent"),
+    print(
+        f"Generated Train windows: {len(train_inds)}, Val windows: {len(val_inds)}, Test windows: {len(test_inds)}"
     )
-    data.update(features)
 
-    # Add IDs
-    if "ids" in data_keys:
-        data["ids"] = torch.tensor(ids_split, dtype=torch.int16)
+    # Drop any window that touches a NaN frame anywhere in its span, but only
+    # bother with the (more expensive, random-access) per-window check if the
+    # pose data actually contains any NaNs at all.
+    with h5py.File(pose_h5_path, "r") as hf:
+        pose_dataset = hf["pose"]
+        if _has_any_nan(pose_dataset):
+            n_train, n_val, n_test = len(train_inds), len(val_inds), len(test_inds)
+            train_inds = _drop_nan_windows(pose_dataset, train_inds)
+            val_inds = _drop_nan_windows(pose_dataset, val_inds)
+            test_inds = _drop_nan_windows(pose_dataset, test_inds)
+            print(
+                "Dropped NaN windows: {} train, {} val, {} test".format(
+                    n_train - len(train_inds),
+                    n_val - len(val_inds),
+                    n_test - len(test_inds),
+                )
+            )
+        else:
+            print("No NaNs found in pose data; skipping NaN window filtering.")
 
-    # Discrete classes for virtual_rodent (currently just one class)
-    data["discrete_classes"] = {}
-
-    # Validate all data has same length
-    for k, v in data.items():
-        if k == "discrete_classes":
-            continue
-        try:
-            assert len(v) == data_len, f"Length mismatch for {k}: {len(v)} != {data_len}"
-        except (AssertionError, TypeError):
-            # offsets can have a different first dimension (n_keypoints,)
-            if k == "offsets" and len(v.shape) == 2:
-                assert v.shape[0] == len(skeleton_config["OFFSET"])
-            else:
-                raise
-
-    return data
-
-    return pose_full, train_inds, val_inds, test_inds, metadata
+    print(
+        f"Final sizes: {len(train_inds)} train, {len(val_inds)} val, {len(test_inds)} test"
+    )
+    return train_inds, val_inds, test_inds

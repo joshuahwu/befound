@@ -1,19 +1,17 @@
 from neuroposelib import read
 import numpy as np
 import befound.data.quaternion as qtn
-from typing import Optional, Type, Union, List
-from torch.utils.data import Dataset
+from typing import Optional, Type, Union, List, Dict
+from torch.utils.data import Dataset, Sampler
 import torch
 from numpy.lib.stride_tricks import sliding_window_view
 from tqdm import trange
-from neuroposelib import read
 import numpy as np
 from typing import List
 import torch
-from torch.utils.data import DataLoader
 import h5py
-import pandas as pd
-from befound.data.constants import OFFSETS_3D, OFFSETS_3D_SUM
+from befound.data.constants import OFFSETS_3D, BODY_SCALE, get_window_size, SEQUENCE_SCALE #OFFSETS_3D_SUM
+
 
 def inv_kin_torch(
     pose: torch.Tensor,
@@ -44,6 +42,8 @@ def inv_kin_torch(
     # root_quat[0] = torch.tensor(
     #     [[1.0, 0.0, 0.0, 0.0]], dtype=pose.dtype, device=pose.device
     # )
+    root_quat[:, 0] = torch.nan_to_num(root_quat[:, 0], 1)
+    root_quat[:, 1:] = torch.nan_to_num(root_quat[:, 1:], 0)
     local_quat[:, 0] = root_quat
 
     for chain in kinematic_tree:
@@ -57,10 +57,6 @@ def inv_kin_torch(
             rot_u_v[:, 1:] = torch.nan_to_num(rot_u_v[:, 1:], 0)
             R_loc = qtn.qmul(qtn.qinv(R), rot_u_v)
             local_quat[:, chain[i + 1], :] = R_loc
-            if torch.isnan(R_loc).sum() > 0:
-                import pdb
-
-                pdb.set_trace()
             R = qtn.qmul(R, R_loc)
 
     return local_quat
@@ -302,6 +298,16 @@ def get_frame_yaw(pose, root_i=0, front_i=1):
     return yaw
 
 
+def get_frame_yaw_torch(pose: torch.Tensor, root_i=0, front_i=1) -> torch.Tensor:
+    """
+    Get yaw of given segment in radians
+    """
+    forward = pose[:, front_i, :] - pose[:, root_i, :]
+    forward = forward / torch.linalg.norm(forward, dim=-1, keepdim=True)
+    yaw = -torch.atan2(forward[:, 1], forward[:, 0])
+    return yaw
+
+
 def get_heading2D(pose, root_i=0, front_i=1):
     """
     NOT USED
@@ -322,6 +328,16 @@ def get_angle2D(angle):  # sin is first, then cos
     i.e., coordinates on a unit circle
     """
     angle2D = np.concatenate([np.sin(angle)[:, None], np.cos(angle)[:, None]], axis=-1)
+    angle2D = angle2D.reshape(angle.shape[:-1] + (-1,))
+    return angle2D
+
+
+def get_angle2D_torch(angle: torch.Tensor) -> torch.Tensor:  # sin is first, then cos
+    """
+    Given angles in radians, return [sin(angle), cos(angle)]
+    i.e., coordinates on a unit circle
+    """
+    angle2D = torch.cat([torch.sin(angle)[:, None], torch.cos(angle)[:, None]], dim=-1)
     angle2D = angle2D.reshape(angle.shape[:-1] + (-1,))
     return angle2D
 
@@ -357,6 +373,30 @@ def get_segment_len(pose: np.ndarray, kinematic_tree: np.ndarray, offset: np.nda
     return offsets
 
 
+def get_segment_len_torch(
+    pose: torch.Tensor, kinematic_tree: torch.Tensor, offset: torch.Tensor
+) -> torch.Tensor:
+    """
+    Get length of all segments in a pose defined by a kinematic tree
+    """
+    offset = offset.to(pose.dtype)
+    parents = [0] * len(offset)
+    parents[0] = -1
+    for chain in kinematic_tree:
+        for j in range(1, len(chain)):
+            parents[chain[j]] = chain[j - 1]
+
+    offsets = offset.unsqueeze(0).repeat(pose.shape[0], 1, 1)
+    for i in range(1, offset.shape[0]):
+        length = torch.linalg.norm(
+            pose[:, i, :] - pose[:, parents[i], :], dim=1, keepdim=True
+        )
+        length = torch.clamp(length, min=1e-3)
+        offsets[:, i] = length * offsets[:, i]
+
+    return offsets
+
+
 def get_speed_outliers(pose, threshold=2.25):
     """
     Find indices of frames in which the average speed is greater than the defined threshold
@@ -369,161 +409,500 @@ def get_speed_outliers(pose, threshold=2.25):
     print("Outlier frames above {}: {}".format(threshold, len(outlier_frames)))
     return outlier_frames
 
-
-class RodentDataset(Dataset):
+class BalancedDatasetSampler(Sampler[int]):
     """
-    Dataset class for Rodent datasets. Supports both single and mixed multi-dataset loading.
+    Samples window indices so each dataset is drawn ~equally in expectation,
+    with replacement, without ever building a single len(dataset)-sized
+    weights tensor (unlike WeightedRandomSampler, whose underlying
+    torch.multinomial call hard-caps the number of categories at 2**24 --
+    far below this class's typical combined window counts).
 
-    Can be initialized with:
-    - Single dataset (dict): backward compatible mode
-    - Multiple datasets (dict[str, dict]): keys are dataset names, values are data dicts
+    Equivalent in distribution to a WeightedRandomSampler with per-window
+    weight 1/counts[dataset_idx] (every window of a dataset sharing the same
+    weight): picking a dataset uniformly at random, then a uniformly random
+    window within it, is the same thing without the oversized weights
+    tensor -- picking only among len(dataset_names) categories instead.
+    """
+
+    def __init__(
+        self, entry_dataset_idx: List[int], num_datasets: int, num_samples: int
+    ):
+        dataset_idx = torch.as_tensor(entry_dataset_idx, dtype=torch.long)
+        self.num_samples = num_samples
+        self.dataset_indices = [
+            torch.nonzero(dataset_idx == i, as_tuple=True)[0]
+            for i in range(num_datasets)
+        ]
+
+    def __iter__(self):
+        num_datasets = len(self.dataset_indices)
+        chosen = torch.randint(0, num_datasets, (self.num_samples,))
+        result = torch.empty(self.num_samples, dtype=torch.long)
+        for d in range(num_datasets):
+            mask = chosen == d
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            pool = self.dataset_indices[d]
+            local = torch.randint(0, len(pool), (n,))
+            result[mask] = pool[local]
+        yield from result.tolist()
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+
+class RodentDiskDataset(Dataset):
+    """
+    Memory-mapped HDF5 dataset supporting multiple H5 files with concatenated indexing.
+
+    Efficiently loads data from disk without loading everything into RAM using HDF5's
+    chunked storage and OS page caching. Supports multiple datasets, each with its
+    own keypoint count; poses are zero-padded to the max keypoint count across
+    datasets so they can be stacked into a batch, and each sample carries a
+    dataset_id so a downstream model can route it to the right decoder head.
+
+    Example:
+        # Single-agent dataset (pose.h5) plus a social dataset backed by
+        # pose_a1.h5 + pose_a2.h5 (both agents share one dataset_id)
+        dataset = RodentDiskDataset(
+            data_path='/path/to/data/',
+            dataset_names=['wu_iclr25', 'sdannce'],
+            train_val_test='train',
+        )
     """
 
     def __init__(
         self,
-        data,
-        kinematic_tree=None,
-        n_keypts=None,
-        offsets_sum=None,
-        include_dataset_id=False,
+        data_path: Union[str, dict],
+        dataset_names: List[str],
+        train_val_test: str,
+        strides: Dict[str, int] = None,
+        use_pe_indices: bool = True,
+        use_default_seg_len: bool = True,
+        model_window: int = 51,
+        min_interp_fps: Optional[int] = None,
+        balanced_sampling: bool = True,
+        virtual_rodent_x_splits: List[str] = ["base"],
+        use_speed_filtered_inds: bool = False,
+        scale_body: bool = False,
+        pose_dtype: torch.dtype = torch.float32,
     ):
         """
         Parameters
         ----------
-        data : dict or dict[str, dict]
-            If dict: single dataset (backward compatible)
-            If dict[str, dict]: multiple datasets keyed by name
-        kinematic_tree : list or dict
-            Single dataset: kinematic tree structure
-            Multi-dataset: dict keyed by dataset name
-        n_keypts : int or dict
-            Single dataset: number of keypoints
-            Multi-dataset: dict keyed by dataset name
-        offsets_sum : float or dict
-            Single dataset: sum of offsets
-            Multi-dataset: dict keyed by dataset name
-        include_dataset_id : bool
-            If True and multi-dataset, add 'dataset_id' to samples (0, 1, 2, ...)
+        data_path : str
+            Root directory containing one subdirectory per dataset name.
+        dataset_names : List[str]
+            Dataset names to load (e.g. "sdannce", "pairr24m", "wu_iclr25", ...).
+            Social datasets ("sdannce", "pairr24m") are backed by three H5
+            files: pose_a1.h5/pose_a2.h5 (paired, sessions where both agents
+            were tracked -- both agents share a single dataset_id and decoder
+            head since they come from the same underlying dataset) and
+            pose_single.h5 (sessions where only one agent was ever tracked).
+        train_val_test : str
+            Split to load ("train", "val", or "test").
+        pose_dtype : torch.dtype
+            dtype "pose" is cast to in __getitem__. Source H5 files are a mix
+            of float32/float64 on disk; this normalizes to a single dtype.
+        model_window, min_interp_fps : int, int or None
+            Same model.window / train.augmentations.fps.min_fps values used
+            to generate the "_2s" splits (befound.data.constants.get_window_size
+            is a pure function of these plus each dataset's fps) -- needed to
+            reconstruct each dataset's window size when the loaded indices
+            file stores only a window's center frame rather than every frame
+            in it. Ignored for any dataset whose indices file is still in the
+            legacy full-window format (2D, window size read off its own shape).
+        balanced_sampling : bool
+            When multiple datasets are loaded and the DataLoader is built with
+            shuffle=True, get_sampler(shuffle) returns a BalancedDatasetSampler
+            so each dataset contributes ~equally per batch in expectation
+            (sampling with replacement -- not every window is guaranteed to
+            appear, and some may repeat, within a given epoch). Set this False
+            for regular indexing instead: get_sampler returns None, so the
+            DataLoader's own shuffle argument controls order and every window
+            is seen exactly once per epoch, in proportion to each dataset's
+            actual size.
         """
-        self.include_dataset_id = include_dataset_id
+        self.pose_dtype = pose_dtype
+        self.model_window = model_window
+        self.min_interp_fps = min_interp_fps
+        self.balanced_sampling = balanced_sampling
+        self.use_speed_filtered_inds = use_speed_filtered_inds
+        self.virtual_rodent_x_splits = virtual_rodent_x_splits
+        self.dataset_names = list(
+            dict.fromkeys(dataset_names)
+        )  # de-duped, order-preserving
+        self.dataset_name_to_idx = {
+            name: i for i, name in enumerate(self.dataset_names)
+        }
 
-        # Detect single vs multi-dataset mode
-        self.is_multi_dataset = False
-        if isinstance(data, dict) and len(data) > 0:
-            # Check if values are dicts (multi-dataset) or tensors (single-dataset)
-            first_val = next(iter(data.values()))
-            if isinstance(first_val, dict):
-                self.is_multi_dataset = True
-
-        if self.is_multi_dataset:
-            self._init_multi_dataset(data, kinematic_tree, n_keypts, offsets_sum)
+        if use_pe_indices:
+            self.pe_indices = {}
         else:
-            self._init_single_dataset(data, kinematic_tree, n_keypts, offsets_sum)
+            self.pe_indices = None
 
-    def _init_single_dataset(self, data, kinematic_tree, n_keypts, offsets_sum):
-        """Initialize for single dataset mode (backward compatible)"""
-        self.data_keys = list(data.keys())
-        self.data = data
-        self.dataset_names = None
-        self.dataset_offsets = None
-        self.discrete_classes = data.get("discrete_classes", {})
+        self._init_pose_files(
+            data_path, dataset_names, use_pe_indices, use_default_seg_len, scale_body
+        )
 
-        self.kinematic_tree = kinematic_tree
-        self.n_keypts = n_keypts
-        self.offsets_sum = offsets_sum
+        if scale_body:
+            self.body_scale = {}
+            for name in dataset_names:
+                if name == "sdannce":
+                    self.body_scale[name] = BODY_SCALE[name]*SEQUENCE_SCALE
+                elif name == "virtual_rodent":
+                    if len(self.virtual_rodent_x_splits) == 3:
+                        self.body_scale[name] = BODY_SCALE[name]*SEQUENCE_SCALE
+                    else:
+                        self.body_scale[name] = 0
+                        n_sessions = 0
+                        for x_split in self.virtual_rodent_x_splits:
+                            n_sessions += BODY_SCALE[f"{name}_{x_split}"][1]
+                            self.body_scale[name] += BODY_SCALE[f"{name}_{x_split}"][0] * BODY_SCALE[f"{name}_{x_split}"][1]
+                        self.body_scale[name] /= n_sessions
+                        self.body_scale[name] *= SEQUENCE_SCALE
+                else:
+                    self.body_scale[name] = BODY_SCALE[name]*SEQUENCE_SCALE
 
-        self.standard_offsets = False
-        if "offsets" in self.data_keys:
-            if self.data["offsets"].ndim == 2:
-                self.standard_offsets = True
+        else:
+            self.body_scale = None
 
-    def _init_multi_dataset(self, datasets: dict, kinematic_tree, n_keypts, offsets_sum):
-        """Initialize for multi-dataset mode"""
-        self.dataset_names = list(datasets.keys())
-        self.datasets = datasets
+        if self.body_scale is not None and self.default_seg_len is not None:
+            # Pre-normalize the canonical segment-length magnitudes by this
+            # same body_scale, so get_default_offsets() returns offsets
+            # already in the normalized units __getitem__ returns pose in --
+            # callers (get_batch_loss/get_batch_loss_per_dataset) never need
+            # to touch body_scale themselves.
+            for name in self.dataset_names:
+                self.default_seg_len[name] = (
+                    self.default_seg_len[name] / self.body_scale[name]
+                )
 
-        # Store per-dataset metadata as dicts
-        self.kinematic_tree = kinematic_tree
-        self.n_keypts = n_keypts
-        self.offsets_sum = offsets_sum
+        self._init_indices(
+            data_path, train_val_test, strides, model_window, min_interp_fps
+        )
 
-        # Find all unique keys across datasets
-        all_keys = set()
-        for d in datasets.values():
-            all_keys.update(d.keys())
-        self.data_keys = list(all_keys)
+    def _init_pose_files(
+        self, data_path, dataset_names, use_pe_indices, use_default_seg_len, scale_body
+    ):
+        """Locate each dataset's h5 file(s), load its skeleton config
+        (kinematic tree, offsets, PE indices, default segment lengths), and
+        open every h5 file -- populates h5_paths/h5_key_to_dataset_name/
+        dataset_to_h5_keys/kinematic_tree/skeleton_offsets/default_seg_len/
+        pe_indices plus the opened h5_file_handles/h5_datasets/h5_ids/
+        n_keypts/max_n_keypts/dataset_idx_to_n_keypts. body_scale is set by
+        __init__ itself, after this call; window indices (self.indices etc.)
+        are handled separately by _init_indices, once these h5_keys exist.
+        """
+        # Normalize to {h5_key -> (path, base_dataset_name)}
+        h5_paths = {}
+        h5_key_to_dataset_name = {}
+        self.dataset_to_h5_keys = {}
+        self.kinematic_tree = {}
+        self.skeleton_offsets = {}
+        self.data_path = data_path
+        if use_default_seg_len:
+            self.default_seg_len = {}
+        else:
+            self.default_seg_len = None
 
-        # Create offsets for indexing: [0, len(ds0), len(ds0)+len(ds1), ...]
-        self.dataset_offsets = [0]
-        for name in self.dataset_names:
-            first_key = [k for k in datasets[name].keys() if k != "discrete_classes"][0]
-            self.dataset_offsets.append(
-                self.dataset_offsets[-1] + len(datasets[name][first_key])
+        for name in dataset_names:
+            if name in ("pairr24m", "sdannce"):
+                # Both are backed by pose_a1.h5/pose_a2.h5 (paired "social"
+                # sessions, shared split) plus pose_single.h5 (sessions where
+                # only one agent was ever tracked, independent split) -- see
+                # ceph/data/pairr24m/code/split_pose_single.py for how
+                # pairr24m's pose_single.h5 was carved out of pose_a1/a2.
+                h5_paths[name + "_a1"] = data_path + name + "/pose_a1.h5"
+                h5_paths[name + "_a2"] = data_path + name + "/pose_a2.h5"
+                h5_paths[name + "_single"] = data_path + name + "/pose_single.h5"
+                h5_key_to_dataset_name[name + "_a1"] = name
+                h5_key_to_dataset_name[name + "_a2"] = name
+                h5_key_to_dataset_name[name + "_single"] = name
+                self.dataset_to_h5_keys[name] = [
+                    name + "_a1",
+                    name + "_a2",
+                    name + "_single",
+                ]
+
+            elif name == "wu_iclr25":
+                h5_paths[name] = data_path + name + "/parkinsons/pose.h5"
+                h5_key_to_dataset_name[name] = name
+                self.dataset_to_h5_keys[name] = [name]
+            elif name == "virtual_rodent":
+                self.dataset_to_h5_keys[name] = []
+                for x_split in self.virtual_rodent_x_splits:
+                    h5_paths[f"{name}_{x_split}"] = (
+                        f"{data_path}{name}/pose_{x_split}.h5"
+                    )
+                    h5_key_to_dataset_name[f"{name}_{x_split}"] = name
+                    self.dataset_to_h5_keys[name].append(f"{name}_{x_split}")
+            else:
+                h5_paths[name] = data_path + name + "/pose.h5"
+                h5_key_to_dataset_name[name] = name
+                self.dataset_to_h5_keys[name] = [name]
+
+            skeleton_configs = read.config(data_path + name + "/skeleton.yaml")
+            self.kinematic_tree[name] = skeleton_configs["KINEMATIC_TREE"]
+            self.skeleton_offsets[name] = torch.tensor(skeleton_configs["OFFSET"], dtype=torch.float32)
+
+            if use_pe_indices:
+                self.pe_indices[name] = torch.tensor(skeleton_configs["PE_INDICES"], dtype=torch.long)
+
+            if use_default_seg_len:
+                self.default_seg_len[name] = torch.tensor(OFFSETS_3D[name], dtype=torch.float32)
+
+        self.h5_paths = h5_paths
+        self.h5_key_to_dataset_name = h5_key_to_dataset_name
+        self.h5_file_handles = {}
+        self.h5_datasets = {}
+        self.h5_ids = {}
+        self.n_keypts = {}  # base dataset_name -> n_keypts
+
+        # Open all H5 files and cache memory-mapped references
+        for h5_key, path in self.h5_paths.items():
+            try:
+                h5_file = h5py.File(path, "r")
+                self.h5_file_handles[h5_key] = h5_file
+
+                # Get memory-mapped reference to dataset
+                self.h5_datasets[h5_key] = h5_file[
+                    "pose"
+                ]  # Assuming 'pose' is the key for pose data
+                self.h5_ids[h5_key] = h5_file["ids"]
+
+                dataset_name = h5_key_to_dataset_name[h5_key]
+                self.n_keypts[dataset_name] = len(h5_file["pose"][0])
+
+            except Exception as e:
+                # Clean up already-opened files
+                for h5f in self.h5_file_handles.values():
+                    h5f.close()
+                raise RuntimeError(f"Failed to open H5 file {path}: {e}")
+
+        self.max_n_keypts = max(self.n_keypts.values())
+        # dataset_idx -> n_keypts, matching the enumeration order used for dataset_id
+        self.dataset_idx_to_n_keypts = {
+            idx: self.n_keypts[name] for idx, name in enumerate(self.dataset_names)
+        }
+
+    def _init_indices(self, data_path, train_val_test, strides, model_window, min_interp_fps):
+        """Load each h5_key's window indices for this split, derive its
+        window size, and flatten every h5_key's windows into one global,
+        indexable sample list (self._entries/_entry_dataset_idx). Depends on
+        self.h5_paths/h5_key_to_dataset_name, so must run after
+        _init_pose_files.
+        """
+        # Load window indices per H5 file (frame indices local to that file).
+        # Two on-disk formats are supported: legacy full windows (2D,
+        # (n_windows, window_size), window_size read off the array's own
+        # shape) and the newer center-only format (1D, (n_windows,) -- just
+        # each window's center frame; window_size instead derived via
+        # get_window_size, the same pure function of model_window /
+        # min_interp_fps / each dataset's fps that generated it, so it's
+        # still never passed between the generator and this loader directly).
+        self.indices = {}
+        self.window_size = {}
+        filtered_append = "_filtered_offsets" if self.use_speed_filtered_inds else ""
+        for h5_key in self.h5_paths.keys():
+            base_name = self.h5_key_to_dataset_name[h5_key]
+            if h5_key.startswith("pairr24m") or h5_key.startswith("sdannce"):
+                if h5_key.endswith("_a1") or h5_key.endswith("_a2"):
+                    # a1/a2 share one split, saved with a "_social" suffix
+                    self.indices[h5_key] = np.load(
+                        f"{data_path}{base_name}/{train_val_test}_inds_social_2s{filtered_append}.npy"
+                    ).astype(np.int32)[:: strides[base_name]]
+                elif h5_key.endswith("_single"):
+                    self.indices[h5_key] = np.load(
+                        f"{data_path}{base_name}/{train_val_test}_inds_single_2s{filtered_append}.npy"
+                    ).astype(np.int32)[:: strides[base_name]]
+            elif base_name == "wu_iclr25":
+                self.indices[h5_key] = np.load(
+                    f"{data_path}{base_name}/parkinsons/{train_val_test}/inds_2s{filtered_append}.npy"
+                ).astype(np.int32)[:: strides["wu_iclr25"]]
+            elif base_name == "virtual_rodent":
+                if h5_key.endswith("_base"):
+                    self.indices[h5_key] = np.load(
+                        f"{data_path}{base_name}/{train_val_test}_inds_2s{filtered_append}.npy"
+                    ).astype(np.int32)[:: strides["virtual_rodent"]]
+                else:
+                    x_split = h5_key.split("_")[-1]
+                    self.indices[h5_key] = np.load(
+                        f"{data_path}{base_name}/{train_val_test}_inds_{x_split}_2s{filtered_append}.npy"
+                    ).astype(np.int32)[:: strides["virtual_rodent"]]
+            else:
+                self.indices[h5_key] = np.load(
+                    f"{data_path}{base_name}/{train_val_test}_inds_2s{filtered_append}.npy"
+                ).astype(np.int32)[:: strides[h5_key]]
+
+            if self.indices[h5_key].ndim == 2:
+                self.window_size[base_name] = self.indices[h5_key].shape[-1]
+            else:
+                self.window_size[base_name] = get_window_size(
+                    base_name, model_window, min_interp_fps
+                )
+
+            print(
+                f"Loading {train_val_test} indices for {h5_key}: {len(self.indices[h5_key])} windows"
             )
 
-        # Merge discrete_classes from all datasets
-        self.discrete_classes = {}
-        for name, dataset in datasets.items():
-            for key, val in dataset.get("discrete_classes", {}).items():
-                if key not in self.discrete_classes:
-                    self.discrete_classes[key] = val
+        self.max_window_size = max(self.window_size.values())
+        # dataset_idx -> window_size, matching the enumeration order used for dataset_id
+        self.window_size_actual = {
+            idx: self.window_size[name] for idx, name in enumerate(self.dataset_names)
+        }
 
-        # Check offsets standardness (assume same across datasets)
-        self.standard_offsets = False
-        for d in datasets.values():
-            if "offsets" in d and d["offsets"].ndim == 2:
-                self.standard_offsets = True
-                break
+        # Flatten per-file windows into one global, indexable sample list.
+        # Each entry is (h5_key, local_window_idx); pose_a1/pose_a2 windows
+        # are separate samples but share dataset_id (same base dataset).
+        self._entries = []
+        self._entry_dataset_idx = []
+        for h5_key in self.h5_paths.keys():
+            dataset_idx = self.dataset_name_to_idx[self.h5_key_to_dataset_name[h5_key]]
+            n_windows = len(self.indices[h5_key])
+            self._entries.extend((h5_key, i) for i in range(n_windows))
+            self._entry_dataset_idx.extend([dataset_idx] * n_windows)
 
-    def __len__(self):
-        if self.is_multi_dataset:
-            return self.dataset_offsets[-1]  # Total length across all datasets
-        else:
-            return len(self.data[self.data_keys[0]])
+    def __len__(self) -> int:
+        """Return number of windows across all datasets/files"""
+        return len(self._entries)
 
-    def __getitem__(self, idx):
+    def _full_window_indices(self, indices: np.ndarray, base_name: str) -> np.ndarray:
+        """Expand `indices` to full window frame-index array(s), regardless of
+        whether the on-disk format stores full windows or just each window's
+        center frame. Handles both a batch (indices.ndim == 2: full windows,
+        returned as-is; ndim == 1 with length != window_size: a batch of
+        center indices, expanded) and a single sample already pulled out of
+        that batch (ndim == 1 with length == window_size: one full window,
+        returned as-is; ndim == 0: one center index, expanded) -- the same
+        window_size-vs-not-window_size length check distinguishes "already a
+        full window" from "a batch of centers" in both cases."""
+        indices = np.asarray(indices)
+        window_size = self.window_size[base_name]
+        if indices.ndim == 2 or (
+            indices.ndim == 1 and indices.shape[-1] == window_size
+        ):
+            return indices
+        half = window_size // 2
+        offsets = np.arange(-half, half + 1)
+        return indices[..., None] + offsets
+
+    def get_default_offsets(self, device) -> Optional[Dict[str, torch.Tensor]]:
+        """Combined (n_keypts, 3) canonical offsets (magnitude x direction)
+        per dataset, used by get_batch_loss/get_batch_loss_per_dataset to
+        reconstruct pose_hat in the same canonical skeleton space
+        target_pose was built in. None if this dataset has no
+        default_seg_len (use_default_seg_len=False)."""
+        if not self.default_seg_len:
+            return None
+        return {
+            k: (self.default_seg_len[k][:, None] * self.skeleton_offsets[k]).to(device)
+            for k in self.dataset_names
+        }
+
+    def get_sampler(self, shuffle: bool) -> Optional["BalancedDatasetSampler"]:
         """
-        Get a sample by global index.
-        In multi-dataset mode, maps global index to dataset and local index.
+        Sampler to pass to the DataLoader, or None.
+
+        If self.balanced_sampling and shuffle and more than one dataset is
+        loaded: a BalancedDatasetSampler so each dataset contributes ~equally
+        per batch in expectation, sampling with replacement -- not a strict
+        single pass over the data. (Not a WeightedRandomSampler: that calls
+        torch.multinomial, which hard-caps the number of categories --
+        i.e. len(self) here -- at 2**24, far below this class's typical
+        window counts.)
+
+        Otherwise: None, for regular indexing -- pass this straight to
+        DataLoader(sampler=...) alongside shuffle=shuffle (unchanged); with no
+        sampler, the DataLoader's own shuffle argument determines order and
+        every window is returned exactly once per epoch.
         """
-        query = {}
+        if not shuffle or not self.balanced_sampling or len(self.dataset_names) <= 1:
+            return None
+        return BalancedDatasetSampler(
+            self._entry_dataset_idx, len(self.dataset_names), len(self)
+        )
 
-        if self.is_multi_dataset:
-            # Find which dataset this index belongs to
-            dataset_idx = 0
-            for i, offset in enumerate(self.dataset_offsets[:-1]):
-                if offset <= idx < self.dataset_offsets[i + 1]:
-                    dataset_idx = i
-                    break
+    def __getitem__(self, idx: int) -> dict:
+        """
+        Get a sample by global window index.
 
-            local_idx = idx - self.dataset_offsets[dataset_idx]
-            dataset_name = self.dataset_names[dataset_idx]
-            dataset = self.datasets[dataset_name]
+        Pose is zero-padded along the time axis to self.max_window_size and
+        along the keypoint axis to self.max_n_keypts so that samples from
+        datasets with different window sizes and/or keypoint counts can be
+        stacked by the default collate_fn. dataset_id/dataset_name identify
+        which decoder head the sample should be routed to; pose_a1/pose_a2
+        windows from a social dataset are separate samples that share the
+        same dataset_id.
 
-            # Get data from the correct dataset
-            for k in self.data_keys:
-                if k == "discrete_classes":
-                    continue
-                if k not in dataset:
-                    continue
-                v = dataset[k]
+        Returns
+        -------
+        dict with keys:
+            pose : torch.Tensor, shape (max_window_size, max_n_keypts, 3), self.pose_dtype
+            ids : torch.Tensor, scalar, int16 (matches on-disk H5 "ids" dtype)
+            dataset_id : torch.Tensor, scalar, int8 (small enumeration of datasets)
+            dataset_name : str
+        """
+        h5_key, local_window_idx = self._entries[idx]
+        if len(self.dataset_names) != 1:
+            dataset_idx = self._entry_dataset_idx[idx]
+        # dataset_name = self.dataset_names[dataset_idx]
 
-                if (k in ["offsets"]) and self.standard_offsets:
-                    query[k] = v
-                else:
-                    query[k] = v[local_idx]
+        # A single sample's raw stored value is either a full window (2D
+        # on-disk format) or just its center frame (1D format) -- expand the
+        # latter cheaply per-sample here (_full_window_indices also handles
+        # the batched case, used instead for the one-time
+        # remove_speed_outliers setup in __init__).
+        base_name = self.h5_key_to_dataset_name[h5_key]
+        raw = self.indices[h5_key][local_window_idx]
+        window_inds = self._full_window_indices(raw, base_name)
 
-            # Add dataset metadata if requested
-            if self.include_dataset_id:
-                query["dataset_id"] = torch.tensor(dataset_idx, dtype=torch.long)
-                query["dataset_name"] = dataset_name
+        pose = self.h5_datasets[h5_key][window_inds]
+        # Center frame of this sample's own window, not a fixed global window
+        # size -- window length now varies per dataset.
+        ids = self.h5_ids[h5_key][window_inds[len(window_inds) // 2]]
 
-        else:
-            # Single dataset mode (backward compatible)
-            for k, v in self.data.items():
-                if (k in ["offsets"]) and self.standard_offsets:
-                    query[k] = v
-                else:
-                    query[k] = v[idx]
+        pose = torch.from_numpy(pose).to(self.pose_dtype)
+        if self.body_scale is not None:
+            pose = pose / self.body_scale[base_name]
+        n_frames, n_keypts = pose.shape[0], pose.shape[1]
 
-        return query
+        if n_frames < self.max_window_size:
+            pose = torch.nn.functional.pad(
+                pose, (0, 0, 0, 0, 0, self.max_window_size - n_frames)
+            )
+        if n_keypts < self.max_n_keypts:
+            pose = torch.nn.functional.pad(
+                pose, (0, 0, 0, self.max_n_keypts - n_keypts)
+            )
+
+        data = {
+            "pose": pose,
+            "ids": torch.from_numpy(np.asarray(ids)).to(torch.int16),
+        }
+        if self.pe_indices is not None:
+            pe_indices = self.pe_indices[self.h5_key_to_dataset_name[h5_key]]
+            if n_keypts < self.max_n_keypts:
+                # Pad with 6, the reserved "no region" class (PE_INDICES only uses
+                # 0-5) so ChannelInvariantEncoder's 7-slot embedding stays in range;
+                # per-dataset processing slices back to dataset_idx_to_n_keypts regardless.
+                pe_indices = torch.nn.functional.pad(
+                    pe_indices, (0, self.max_n_keypts - n_keypts), value=6
+                )
+            data["pe_indices"] = pe_indices
+        if len(self.dataset_names) != 1:
+            data["dataset_id"] = torch.tensor(dataset_idx, dtype=torch.int8)
+        return data
+
+    def __del__(self):
+        """Clean up by closing all H5 files"""
+        for h5_file in self.h5_file_handles.values():
+            try:
+                h5_file.close()
+            except:
+                pass
+
+    def close(self):
+        """Explicitly close all H5 files"""
+        self.__del__()

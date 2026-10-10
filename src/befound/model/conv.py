@@ -354,7 +354,7 @@ class Conv1DDecoder(nn.Module):
                 Conv1DDecoderBlock(
                     in_channels=hidden_dim[i],
                     hidden_dim=(
-                        self.out_channels if (i == self.n_us - 1) else hidden_dim[i + 1]
+                        self.head_in_channels if (i == self.n_us - 1) else hidden_dim[i + 1]
                     ),
                     depth=depth,
                     stride=strides[i],
@@ -364,22 +364,30 @@ class Conv1DDecoder(nn.Module):
                     out_kernel_size=4,
                 )
             )
+
+        layers.append(nn.Conv1d(
+                self.hidden_dim[-1],
+                self.hidden_dim[-1],
+                kernel_size=out_kernel_size,
+                stride=1,
+                padding=0,
+            ))
         self.backbone = nn.Sequential(*layers)
 
         if isinstance(self.out_channels, dict):
             self.out = nn.ModuleDict({k: nn.Conv1d(
                 self.hidden_dim[-1],
                 self.out_channels[k],
-                kernel_size=out_kernel_size,
+                kernel_size=1,
                 stride=1,
                 padding=0,
             ) for k in self.out_channels.keys()})
 
-        elif isinstance(self.out_channles, int):
+        elif isinstance(self.out_channels, int):
             self.out = nn.Conv1d(
                 self.out_channels,
                 self.out_channels,
-                kernel_size=out_kernel_size,
+                kernel_size=1,
                 stride=1,
                 padding=0,
             )
@@ -418,23 +426,26 @@ class Conv1DDecoder(nn.Module):
 
         # Multiple dataset-specific heads - keep outputs separated by dataset
         if isinstance(self.out_channels, dict):
-            if dataset_id is None:
+            dataset_names = list(self.out_channels.keys())
+            if dataset_id is None and len(dataset_names) != 1:
                 raise ValueError("dataset_id required when using dict output heads")
 
             # Initialize output dict for all datasets
             output = {}
 
             # Route each sample to its dataset's head
-            dataset_names = list(self.out_channels.keys())
             for dataset_idx, dataset_name in enumerate(dataset_names):
-                # Find samples belonging to this dataset
-                mask = dataset_id == dataset_idx
-                if not mask.any():
-                    output[dataset_name] = torch.empty(0, device=x.device)
-                    continue
-
-                # Extract samples for this dataset
-                x_dataset = x[mask]  # (n_samples, channels, T)
+                # Find samples belonging to this dataset. With a single
+                # dataset, dataset_id may be omitted entirely -- every
+                # sample belongs to it, so skip masking.
+                if dataset_id is None:
+                    x_dataset = x
+                else:
+                    mask = dataset_id == dataset_idx
+                    if not mask.any():
+                        output[dataset_name] = torch.empty(0, device=x.device)
+                        continue
+                    x_dataset = x[mask]  # (n_samples, channels, T)
 
                 # Apply dataset-specific head
                 out_dataset = torch.tanh(self.out[dataset_name](x_dataset))

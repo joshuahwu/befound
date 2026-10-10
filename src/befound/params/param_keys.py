@@ -2,7 +2,7 @@ PARAM_KEYS = dict(
     data=[
         "batch_size",
         "data_path",
-        "dataset",
+        "datasets",
         "direction_process",
         "normalize",
         "remove_speed_outliers",
@@ -21,5 +21,12 @@ PARAM_KEYS = dict(
         "type",
         "window",
     ],
-    train=["beta_anneal", "lr", "num_epochs", "optimizer", "lr_schedule", "minimal_test"],
+    train=[
+        "beta_anneal",
+        "lr",
+        "num_epochs",
+        "optimizer",
+        "lr_schedule",
+        "minimal_test",
+    ],
 )

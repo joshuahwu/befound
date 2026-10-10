@@ -165,7 +165,9 @@ wandb/
 demo/results/*
 configs/*
 !configs/mouse_skeleton.yaml
-scripts/*
+# scripts/*
+*/batch/*
+*/figures/*
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
