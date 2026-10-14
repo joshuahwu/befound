@@ -477,7 +477,7 @@ class RodentDiskDataset(Dataset):
         data_path: Union[str, dict],
         dataset_names: List[str],
         train_val_test: str,
-        strides: Dict[str, int] = None,
+        stride: int = None,
         use_pe_indices: bool = True,
         use_default_seg_len: bool = True,
         model_window: int = 51,
@@ -543,7 +543,7 @@ class RodentDiskDataset(Dataset):
             self.pe_indices = None
 
         self._init_pose_files(
-            data_path, dataset_names, use_pe_indices, use_default_seg_len, scale_body
+            data_path, dataset_names, use_pe_indices, use_default_seg_len
         )
 
         if scale_body:
@@ -580,11 +580,11 @@ class RodentDiskDataset(Dataset):
                 )
 
         self._init_indices(
-            data_path, train_val_test, strides, model_window, min_interp_fps
+            data_path, train_val_test, stride, model_window, min_interp_fps
         )
 
     def _init_pose_files(
-        self, data_path, dataset_names, use_pe_indices, use_default_seg_len, scale_body
+        self, data_path, dataset_names, use_pe_indices, use_default_seg_len
     ):
         """Locate each dataset's h5 file(s), load its skeleton config
         (kinematic tree, offsets, PE indices, default segment lengths), and
@@ -687,7 +687,7 @@ class RodentDiskDataset(Dataset):
             idx: self.n_keypts[name] for idx, name in enumerate(self.dataset_names)
         }
 
-    def _init_indices(self, data_path, train_val_test, strides, model_window, min_interp_fps):
+    def _init_indices(self, data_path, train_val_test, stride, model_window, min_interp_fps):
         """Load each h5_key's window indices for this split, derive its
         window size, and flatten every h5_key's windows into one global,
         indexable sample list (self._entries/_entry_dataset_idx). Depends on
@@ -712,29 +712,29 @@ class RodentDiskDataset(Dataset):
                     # a1/a2 share one split, saved with a "_social" suffix
                     self.indices[h5_key] = np.load(
                         f"{data_path}{base_name}/{train_val_test}_inds_social_2s{filtered_append}.npy"
-                    ).astype(np.int32)[:: strides[base_name]]
+                    ).astype(np.int32)[:: stride]
                 elif h5_key.endswith("_single"):
                     self.indices[h5_key] = np.load(
                         f"{data_path}{base_name}/{train_val_test}_inds_single_2s{filtered_append}.npy"
-                    ).astype(np.int32)[:: strides[base_name]]
+                    ).astype(np.int32)[:: stride]
             elif base_name == "wu_iclr25":
                 self.indices[h5_key] = np.load(
                     f"{data_path}{base_name}/parkinsons/{train_val_test}/inds_2s{filtered_append}.npy"
-                ).astype(np.int32)[:: strides["wu_iclr25"]]
+                ).astype(np.int32)[:: stride]
             elif base_name == "virtual_rodent":
                 if h5_key.endswith("_base"):
                     self.indices[h5_key] = np.load(
                         f"{data_path}{base_name}/{train_val_test}_inds_2s{filtered_append}.npy"
-                    ).astype(np.int32)[:: strides["virtual_rodent"]]
+                    ).astype(np.int32)[:: stride]
                 else:
                     x_split = h5_key.split("_")[-1]
                     self.indices[h5_key] = np.load(
                         f"{data_path}{base_name}/{train_val_test}_inds_{x_split}_2s{filtered_append}.npy"
-                    ).astype(np.int32)[:: strides["virtual_rodent"]]
+                    ).astype(np.int32)[:: stride]
             else:
                 self.indices[h5_key] = np.load(
                     f"{data_path}{base_name}/{train_val_test}_inds_2s{filtered_append}.npy"
-                ).astype(np.int32)[:: strides[h5_key]]
+                ).astype(np.int32)[:: stride]
 
             if self.indices[h5_key].ndim == 2:
                 self.window_size[base_name] = self.indices[h5_key].shape[-1]

@@ -5,6 +5,22 @@ from befound.model.attention import SetAttentiveBlock
 from befound.model.conv import Conv1DEncoder, Conv1DDecoder
 from typing import Dict, Union, List
 
+
+def _one_hot_or_zero(idx: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """
+    One-hot encode idx (any shape), except rows outside [0, num_classes) get
+    an all-zero row instead of raising -- for a discrete scrub_feature like
+    dataset_id, samples from an eval-only dataset (appended past the
+    training class range in get.data_and_model) fall here, since they were
+    deliberately excluded from this disentangling class range.
+    """
+    idx = idx.ravel().long()
+    valid = (idx >= 0) & (idx < num_classes)
+    out = torch.zeros(idx.shape[0], num_classes, dtype=torch.long, device=idx.device)
+    out[valid] = F.one_hot(idx[valid], num_classes)
+    return out
+
+
 class ChannelInvariantEncoder(nn.Module):
     def __init__(
         self,
@@ -94,7 +110,7 @@ class ChannelInvariantEncoder(nn.Module):
         out = out.flatten(1, 2)  # [B, (N or M)*D_out, T']
         return out
 
-    def forward(self, x: torch.Tensor, pe_indices=None, dataset_id=None, n_keypts=None, **kwargs):
+    def forward(self, x: torch.Tensor, pe_indices=None, dataset_id=None, **kwargs):
         """
         Forward pass with optional per-dataset processing.
 
@@ -106,17 +122,12 @@ class ChannelInvariantEncoder(nn.Module):
             Positional encoding indices
         dataset_id : torch.Tensor, optional
             Dataset IDs for each sample for per-dataset processing
-        dataset_idx_to_n_keypts : dict, optional
-            Dict mapping dataset_id -> actual n_keypts for indexing padded tensors
         """
         # Single dataset (backward compatible)
         if dataset_id is None:
             # If padded, index to actual keypoints
-            if n_keypts is None:
-                max_actual = max(self.n_keypts.values())
-                x = x[:, :max_actual, :, :]
-            else:
-                x = x[:, :n_keypts, :, :]
+            max_actual = max(self.n_keypts.values())
+            x = x[:, :max_actual, :, :]
 
             out = self._forward(x, pe_indices, **kwargs)
             return out
@@ -141,18 +152,13 @@ class ChannelInvariantEncoder(nn.Module):
             if not mask.any():
                 continue
 
-            if n_keypts is None:
-                n_keypts = self.n_keypts[self.dataset_names[ds_idx]]
-            x_dataset = x[mask, :n_keypts]
-
-            # Index to actual keypoints for this dataset
-            # if dataset_idx_to_n_keypts is not None:
-            # x_dataset = x_dataset[:, :n_kpts, :, :]
+            n_keypts_ds = self.n_keypts[self.dataset_names[ds_idx]]
+            x_dataset = x[mask, :n_keypts_ds]
 
             # Extract pe_indices for this dataset
             pe_idx_dataset = None
             if pe_indices is not None:
-                pe_idx_dataset = pe_indices[mask, :n_keypts]
+                pe_idx_dataset = pe_indices[mask, :n_keypts_ds]
 
             # Forward pass
             out[mask] = self._forward(x_dataset, pe_idx_dataset, **kwargs)
@@ -282,7 +288,7 @@ class ResVAEBase(VAE):
 
         self.mi_estimator = None
 
-    def encode(self, data, n_keypts=None):
+    def encode(self, data):
         """Common encode logic for all ResVAE variants (2D and 3D)."""
         data_o = {}
 
@@ -290,12 +296,11 @@ class ResVAEBase(VAE):
         x_key = "x2d" if self.is_2d else "x3d"
         x = data[x_key].permute(0, 2, 3, 1)  # [B, D, T, n_keypts] -> [B, n_keypts, D, T]
 
-        # Pass dataset_id and dataset_idx_to_n_keypts for per-dataset processing
+        # Pass dataset_id for per-dataset processing
         dataset_id = data.get("dataset_id", None)
-        # dataset_idx_to_n_keypts = data.get("dataset_idx_to_n_keypts", None)
         pe_indices = data.get("pe_indices", None)
 
-        out = self.encoder(x, pe_indices=pe_indices, dataset_id=dataset_id, n_keypts=n_keypts)
+        out = self.encoder(x, pe_indices=pe_indices, dataset_id=dataset_id)
         out = out.flatten(1, 2)
         data_o["mu"] = self.fc_mu(out)
         data_o["logvar"] = self.fc_logvar(out)
@@ -309,7 +314,7 @@ class ResVAEBase(VAE):
             # Concatenating disentanglement/conditional variables together
             data_o["var"] = [
                 (
-                    F.one_hot(data[k].ravel().long(), len(self.discrete_classes[k]))
+                    _one_hot_or_zero(data[k], len(self.discrete_classes[k]))
                     if k in self.discrete_classes.keys()
                     else data[k]
                 )
@@ -391,6 +396,7 @@ class CIResVAE(ResVAEBase):
         self.n_keypts = n_keypts
         self.out_channels = out_channels
         self.window_size = window_size
+        self.window = window_size
         self.is_2d = is_2d
         self.dataset_names = dataset_names
         self.use_be = use_be
@@ -468,6 +474,7 @@ class ResVAE(ResVAEBase):
         self.out_channels = out_channels
         self.depth = depth
         self.window_size = window_size
+        self.window = window_size
         self.n_keypts = n_keypts
         self.is_2d = is_2d
         self.dataset_names = dataset_names

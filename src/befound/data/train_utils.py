@@ -5,7 +5,7 @@ from befound.data import (
     get_angle2D_torch,
     get_segment_len_torch,
 )
-from befound.data.constants import DATA_FPS
+from befound.data.constants import DATA_FPS, DEFAULT_AUGMENTATIONS
 from typing import Dict, List, Union, Optional
 import torch
 import befound.data.quaternion as qtn
@@ -204,6 +204,7 @@ def prepare_batch(
     model_window: int = 51,
     device: str = "cuda",
     get_2d: bool = False,
+    scrub_features: Optional[List[str]] = None,
 ):
     """
     Parameters
@@ -214,7 +215,15 @@ def prepare_batch(
         skeleton_offsets, default_seg_len, window_size -- as attributes, so
         callers don't have to pull them off the dataset themselves (see
         befound.train.trainer.train_epoch/test_epoch).
+    scrub_features : List[str], optional
+        model.scrub_features -- disentangle features the model's decode()
+        unconditionally reads from data (e.g. data["fps"]) regardless of
+        whether that augmentation is actually active this batch. A default
+        is created for any of "rotation"/"2d_project"/"fps" that's either
+        here or actively augmented this batch; with neither, there's no
+        reason to materialize it.
     """
+    scrub_features = scrub_features or []
     dataset_names = dataset.dataset_names
     kinematic_tree = dataset.kinematic_tree
     dataset_idx_to_n_keypts = dataset.dataset_idx_to_n_keypts
@@ -241,19 +250,27 @@ def prepare_batch(
         data["x3d"] = torch.zeros((B, W, N_MAX, 3), dtype=torch.float32, device=device)
         data["target_pose"] = torch.zeros_like(data["x3d"])
 
-    if _augment_enabled(augment_dict, "rotation"):
+    # The model's decode() reads data[feature] unconditionally whenever that
+    # feature is in scrub_features (disentangling it), regardless of whether
+    # the augmentation actually ran this batch -- so a default has to exist
+    # whenever either is true, not just when the augmentation is active.
+    need_rotation = _augment_enabled(augment_dict, "rotation") or "rotation" in scrub_features
+    need_2d_project = _augment_enabled(augment_dict, "2d_project") or "2d_project" in scrub_features
+    need_fps = _augment_enabled(augment_dict, "fps") or "fps" in scrub_features
+
+    if need_rotation:
         # Identity rotation's 6D continuous representation, used as the default
-        # for every sample so data["R_view_6d"] is always well-defined even when
+        # for every sample so data["rotation"] is always well-defined even when
         # the "rotation" augmentation is disabled or skips a given sample.
         identity_6d = torch.tensor(
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float32, device=device
         )
         data["rotation"] = identity_6d.expand(B, 6).clone()
 
-    if _augment_enabled(augment_dict, "2d_project"):
+    if need_2d_project:
         data["2d_project"] = torch.zeros((B, 1), dtype=torch.long, device=device)
 
-    if _augment_enabled(augment_dict, "fps"):
+    if need_fps:
         data["fps"] = torch.zeros((B, 1), dtype=torch.float32, device=device)
 
     has_dataset_id = "dataset_id" in data
@@ -286,22 +303,32 @@ def prepare_batch(
         )
         pose_d_id = pose_d_id[:, :W_d_id]
         native_fps = DATA_FPS[dataset_name]
+        # Bounds for rescaling data["fps"] into [-1, 1] below -- augment_dict's
+        # own bounds when fps augmentation is actually enabled there, else
+        # DEFAULT_AUGMENTATIONS["fps"] (covers augment_dict={} entirely, as in
+        # test_epoch_per_dataset, and also the YAML "disabled" spelling
+        # _augment_enabled itself treats as off: fps: {min_fps: null, ...}).
+        fps_enabled = _augment_enabled(augment_dict, "fps")
+        fps_bounds = augment_dict["fps"] if fps_enabled else DEFAULT_AUGMENTATIONS["fps"]
+        min_fps = fps_bounds["min_fps"]
+        max_fps = fps_bounds["max_fps"]
 
-        if _augment_enabled(augment_dict, "fps"):
-            min_fps = augment_dict["fps"]["min_fps"]
-            max_fps = augment_dict["fps"]["max_fps"]
+        if fps_enabled:
             target_fps = (
                 torch.rand(B_id, device=pose_d_id.device) * (max_fps - min_fps)
                 + min_fps
             )
-            data["fps"][mask] = target_fps[:, None]
             interp_mode = augment_dict["fps"].get("mode", "linear")
         else:
             # No fps augmentation: resample at native_fps, which reduces to
             # an exact center crop to model_window frames (no interpolation,
-            # so the choice of mode doesn't matter here).
+            # so the choice of mode doesn't matter here). Also doubles as
+            # data["fps"]'s default -- the dataset's real fps, not 0.
             target_fps = torch.full((B_id,), float(native_fps), device=pose_d_id.device)
             interp_mode = "linear"
+
+        if need_fps:
+            data["fps"][mask] = 2 * (target_fps[:, None] - min_fps) / (max_fps - min_fps) - 1
 
         pose_d_id = interpolate_center_window(
             pose_d_id, native_fps, target_fps, W, mode=interp_mode

@@ -428,7 +428,7 @@ def get_batch_loss(
             # else:
             #     latent = data_o["mu"]
 
-            if method == "moving_avg_lsq":
+            if method == "moving_avg_lsq" and key + "_mals" in loss_scale.keys():
                 batch_loss[key + "_mals"] = (
                     scrubbers[key].evaluate_loss(
                         data_o["disentangle"][method][key][0],
@@ -438,17 +438,17 @@ def get_batch_loss(
                     / batch_size
                 )
 
-            if method == "qda":
+            if method == "qda" and key + "_qda" in loss_scale.keys():
                 batch_loss[key + "_qda"] = (
                     scrubbers[key].evaluate_loss(data_o["mu"], data[key]) / batch_size
                 )
 
-            if method == "direct_lsq":
+            if method == "direct_lsq" and key + "_lsq" in loss_scale.keys():
                 batch_loss[key + "_lsq"] = direct_lsq_loss(
                     data_o["mu"], data[key], bias=loss_scale[key + "_lsq"] < 0
                 )
 
-            if method == "grad_reversal":
+            if method == "grad_reversal" and key + "_gr" in loss_scale.keys():
                 batch_loss[key + "_gr"] = 0
                 for gr_e in data_o["disentangle"][method][key]:
                     if key == "ids":
@@ -467,12 +467,12 @@ def get_batch_loss(
                         / batch_size
                     )
 
-            if method == "moving_avg":
+            if method == "moving_avg" and key + "_ma" in loss_scale.keys():
                 batch_loss[key + "_ma"] = (
                     scrubbers[key].evaluate_loss(data_o["mu"], data[key]) / batch_size
                 )
 
-            if method == "adversarial_net":
+            if method == "adversarial_net" and key + "_an" in loss_scale.keys():
                 var_ind = model.disentangle_keys.index(key)
                 z_aug, var_aug = scrubbers[key].shuffle(
                     data_o["mu"], data_o["var"], var_ind

@@ -295,7 +295,7 @@ DATA_WINDOW = {
 
 DEFAULT_AUGMENTATIONS = {
     "2d_project": {"prob": 0.2},
-    "fps": {"max_fps": 90, "min_fps": 25, "mode": "linear"},
+    "fps": {"max_fps": 100, "min_fps": 25, "mode": "cubic"},
     "kpt_ablation": {"max_ablate": 5, "prob": 0.1},
     "kpt_shuffle": True,
     "rotation": {"pole_concentration": 2},

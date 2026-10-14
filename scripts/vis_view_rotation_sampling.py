@@ -120,7 +120,7 @@ def plot_random_view_pose_grids():
         data_path=DATA_PATH,
         dataset_names=DATASETS,
         train_val_test="train",
-        strides={name: 1 for name in DATASETS},
+        stride=1,
         min_interp_fps=25,
         balanced_sampling=False,
         virtual_rodent_x_splits=["base", "xsession", "xsubject"],

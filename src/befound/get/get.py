@@ -46,12 +46,21 @@ def data_and_model(
     for is_shuffle, split in zip(shuffle, train_val_test):
         data_config = config["data"].copy()
         if split in ["val", "test"] and use_all_test_val_data:
-            data_config["datasets"] = [
+            # dataset_id is assigned by position in this list (see
+            # RodentDiskDataset), and the model's per-dataset decoder/encoder
+            # heads are built from config["data"]["datasets"]'s order (see
+            # get_model below) -- so any dataset also used in training must
+            # keep its original position here, with eval-only datasets
+            # (missing from training) appended after, not spliced in.
+            all_datasets = [
                 "wu_iclr25",
                 "pairr24m",
                 "mouse_ephys",
                 "sdannce",
                 "virtual_rodent",
+            ]
+            data_config["datasets"] = config["data"]["datasets"] + [
+                name for name in all_datasets if name not in config["data"]["datasets"]
             ]
 
         # curr_data_keys = val_data_keys if split == "val" else data_keys
@@ -82,15 +91,39 @@ def data_and_model(
     if "2d_project" in config["disentangle"].keys():
         discrete_classes["2d_project"] = [0, 1]
     if "dataset_id" in config["disentangle"].keys():
+        # Deliberately scoped to the training datasets only -- eval-only
+        # datasets appended above (see use_all_test_val_data) exist purely
+        # for per-dataset jpe/root metrics and must stay out of the
+        # disentangling bottleneck, not get their own learned class. Their
+        # dataset_id values fall outside this range; decode() handles that
+        # (see ResVAEBase.decode's one-hot construction).
         discrete_classes["dataset_id"] = [
             i for i in range(len(config["data"]["datasets"]))
         ]
+    # The encoder has to process every sample in a batch, including any
+    # eval-only datasets appended above -- so unlike out_channels/n_keypts
+    # (kept training-only, below), its n_keypts/dataset_names need to cover
+    # the union of every loader actually built here. model_dataset_names
+    # is whichever loader's own list is longest, since that list's order
+    # already matches how its RodentDiskDataset assigned dataset_id (training
+    # datasets first, in their original order, eval-only ones appended after
+    # -- see use_all_test_val_data above), and merging n_keypts dicts is
+    # order-independent.
+    model_dataset_names = max(
+        (l.dataset.dataset_names for l in loader_dict.values()), key=len
+    )
+    model_n_keypts = {}
+    for l in loader_dict.values():
+        model_n_keypts.update(l.dataset.n_keypts)
+
     model = get_model(
         model_config=config["model"],
         load_model=load_model,
         epoch=epoch,
         n_keypts=loader_dict[train_val_test[0]].dataset.n_keypts,
         dataset_names=config["data"]["datasets"],
+        model_n_keypts=model_n_keypts,
+        model_dataset_names=model_dataset_names,
         disentangle_config=config["disentangle"],
         loss_config=config["loss"],
         discrete_classes=discrete_classes,
@@ -226,14 +259,14 @@ def get_rodent_data_disk(
     #     if use_be:
     #         pe_indices[dataset_name] = torch.tensor(skeleton_configs[dataset_name]["PE_INDICES"], dtype=torch.long)
 
-    strides = {k: v for k, v in zip(data_config["datasets"], data_config["stride"])}
+    # strides = {k: v for k, v in zip(data_config["datasets"], data_config["stride"])}
     dataset = RodentDiskDataset(
         data_path=data_config["data_path"],
         dataset_names=data_config["datasets"],
         train_val_test=train_val_test,
         # kinematic_tree=kinematic_trees,
         # pe_indices=pe_indices,
-        strides=strides,
+        stride=data_config["stride"],
         use_pe_indices=use_pe_indices,
         # skeleton_offsets=skeleton_offsets,
         use_default_seg_len=use_default_seg_len,
@@ -383,6 +416,8 @@ def get_model(
     epoch,
     n_keypts: Union[int, Dict[str, int]] = 51,
     dataset_names: List[str] = [],
+    model_n_keypts: Optional[Dict[str, int]] = None,
+    model_dataset_names: Optional[List[str]] = None,
     disentangle_config: Optional[Dict] = {},
     loss_config: Optional[Dict] = {},
     discrete_classes: Optional[Dict] = {},
@@ -396,6 +431,13 @@ def get_model(
     ----------
     n_keypts : int or Dict[str, int]
         For single-dataset: scalar keypoint count
+    model_n_keypts, model_dataset_names : Dict[str, int], List[str], optional
+        Used for the encoder's own per-dataset keypoint lookup instead of
+        n_keypts/dataset_names, if given -- the encoder has to process every
+        sample in a batch, including eval-only datasets that aren't among
+        n_keypts/dataset_names (which stay training-only, since they also
+        determine the decoder's out_channels/learned head count and must
+        match a loaded checkpoint). Defaults to n_keypts/dataset_names.
         For multi-dataset: dict mapping dataset_name -> keypoint count
     """
 
@@ -408,6 +450,11 @@ def get_model(
     # else:
     #     conditional_keys = None
     #     conditional_dim = 0
+
+    model_n_keypts = model_n_keypts if model_n_keypts is not None else n_keypts
+    model_dataset_names = (
+        model_dataset_names if model_dataset_names is not None else dataset_names
+    )
 
     scrubber_dict = {}
     scrub_features = list(disentangle_config.keys())
@@ -479,8 +526,8 @@ def get_model(
             latent_dim=model_config["latent_dim"],
             depth=model_config["depth"],
             activation=model_config["activation"],
-            n_keypts=n_keypts,
-            dataset_names=dataset_names,
+            n_keypts=model_n_keypts,
+            dataset_names=model_dataset_names,
             out_kernel_size=model_config["out_kernel_size"],
             prior=model_config["prior"],
             window_size=model_config["window"],
@@ -500,8 +547,8 @@ def get_model(
             depth=model_config["depth"],
             query_size=model_config["query_size"],
             activation=model_config["activation"],
-            n_keypts=n_keypts,
-            dataset_names=dataset_names,
+            n_keypts=model_n_keypts,
+            dataset_names=model_dataset_names,
             out_kernel_size=model_config["out_kernel_size"],
             prior=model_config["prior"],
             window_size=model_config["window"],

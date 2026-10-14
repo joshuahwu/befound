@@ -136,6 +136,7 @@ def train_epoch(config, model, loader, optimizer, scheduler, device="cuda", epoc
                 model_window=config["model"]["window"],
                 device=device,
                 get_2d=config["model"]["is_2d"],
+                scrub_features=model.scrub_features,
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 data_o = predict_batch(model, data)
@@ -212,8 +213,11 @@ def _isolate_augmentation(key):
     value."""
     isolated = {k: None for k in DEFAULT_AUGMENTATIONS}
     value = copy.deepcopy(DEFAULT_AUGMENTATIONS[key])
-    if isinstance(value, dict) and "prob" in value:
-        value["prob"] = 1
+    if isinstance(value, dict):
+        # Dicts without "prob" (fps, rotation) always fire and keep their
+        # parameters as-is
+        if "prob" in value:
+            value["prob"] = 1
     else:
         value = True
     isolated[key] = value
@@ -292,6 +296,7 @@ def test_epoch_per_dataset(config, model, loader, device="cuda", epoch=0, n_batc
                 model_window=config["model"]["window"],
                 device=device,
                 get_2d=config["model"]["is_2d"],
+                scrub_features=model.scrub_features,
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 data_o = predict_batch(model, data)
@@ -420,6 +425,7 @@ def test_epoch(
                 model_window=config["model"]["window"],
                 device=device,
                 get_2d=config["model"]["is_2d"],
+                scrub_features=model.scrub_features,
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 data_o = predict_batch(model, data)
@@ -535,12 +541,10 @@ def train(config, model, loader_dict, run=None):
                 {k: v.cpu() for k, v in model.state_dict().items()},
                 "{}/weights/epoch_{}.pth".format(config["out_path"], epoch),
             )
-
-            if epoch % 2 == 0:
-                torch.save(
-                    {"optimizer": optimizer.state_dict(), "lr_scheduler": scheduler},
-                    "{}/checkpoints/epoch_{}.pth".format(config["out_path"], epoch),
-                )
+            torch.save(
+                {"optimizer": optimizer.state_dict(), "lr_scheduler": scheduler},
+                "{}/checkpoints/epoch_{}.pth".format(config["out_path"], epoch),
+            )
 
             # No augmentation: jpe/root per dataset
             per_dataset_metrics, z_base = test_epoch_per_dataset(
@@ -563,6 +567,14 @@ def train(config, model, loader_dict, run=None):
             config_test = copy.deepcopy(config)
             config_test["loss"] = {"jpe": 1, "root": 1}
             for key in DEFAULT_AUGMENTATIONS:
+                # test_rotation/test_2d_project (per-config, default True for
+                # configs that don't set them) let a config skip one of
+                # these specific sweep entries entirely -- e.g. cheaper eval
+                # for configs where that augmentation isn't meaningful.
+                if key == "rotation" and not config["train"].get("test_rotation", True):
+                    continue
+                if key == "2d_project" and not config["train"].get("test_2d_project", True):
+                    continue
                 config_test["train"]["augmentations"] = _isolate_augmentation(key)
                 # fps/rotation have their own sampled ground-truth value per
                 # window (data["fps"]/data["rotation"]) -- check how much of
@@ -572,7 +584,7 @@ def train(config, model, loader_dict, run=None):
                 # decode -- instead, check whether its latents are
                 # distinguishable from the no-augmentation latents above
                 # (mu_no_aug) at all, via lda/qda group classification.
-                test_metrics = test_epoch(
+                test_metrics, test_z = test_epoch(
                     config=config_test,
                     model=model,
                     loader=loader_dict["val"],
@@ -585,7 +597,7 @@ def train(config, model, loader_dict, run=None):
                 )
 
                 if key == "2d_project":
-                    mu_2d_project = test_metrics.pop("mu")
+                    mu_2d_project = test_z
                     z = torch.cat([z_base, mu_2d_project], dim=0)
                     group = torch.cat(
                         [

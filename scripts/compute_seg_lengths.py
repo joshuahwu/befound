@@ -66,7 +66,7 @@ def main():
             data_path=DATA_PATH,
             dataset_names=[name],
             train_val_test="train",
-            strides={name: 1},
+            stride=1,
             use_pe_indices=True,
             model_window=51,
             min_interp_fps=25,
