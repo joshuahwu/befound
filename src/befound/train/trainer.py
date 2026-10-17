@@ -283,7 +283,7 @@ def test_epoch_per_dataset(config, model, loader, device="cuda", epoch=0, n_batc
     dataset_id_list = []
 
     with torch.no_grad():#_seeded_rng(seed),
-        epoch_metrics = {
+        raw_metrics = {
             name: {"jpe": 0.0, "root": 0.0, "n": 0} for name in dataset_names
         }
         for batch_idx, data in enumerate(loader):
@@ -315,13 +315,13 @@ def test_epoch_per_dataset(config, model, loader, device="cuda", epoch=0, n_batc
                 )
             for name, vals in batch_loss.items():
                 for metric, value in vals.items():
-                    epoch_metrics[name][metric] += float(value)
+                    raw_metrics[name][metric] += float(value)
 
 
         z = torch.cat(z, dim=0)
 
         epoch_metrics = {}
-        for name, vals in epoch_metrics.items():
+        for name, vals in raw_metrics.items():
             epoch_metrics[name] = {
                 "jpe": vals["jpe"] / vals["n"] if vals["n"] else float("nan"),
                 "root": vals["root"] / vals["n"] if vals["n"] else float("nan"),

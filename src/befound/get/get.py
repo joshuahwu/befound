@@ -274,7 +274,7 @@ def get_rodent_data_disk(
         min_interp_fps=min_interp_fps,
         balanced_sampling=balanced_sampling,
         virtual_rodent_x_splits=data_config.get("virtual_rodent_x_splits", []),
-        use_speed_filtered_inds=data_config["use_speed_filtered_inds"],
+        use_filtered_inds=data_config["use_filtered_inds"],
         scale_body=True,
     )  # train_val_test=train_val_test, data_keys=data_keys, use_default_offsets=use_default_offsets)
 

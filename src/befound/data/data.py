@@ -484,7 +484,7 @@ class RodentDiskDataset(Dataset):
         min_interp_fps: Optional[int] = None,
         balanced_sampling: bool = True,
         virtual_rodent_x_splits: List[str] = ["base"],
-        use_speed_filtered_inds: bool = False,
+        use_filtered_inds: bool = False,
         scale_body: bool = False,
         pose_dtype: torch.dtype = torch.float32,
     ):
@@ -528,7 +528,7 @@ class RodentDiskDataset(Dataset):
         self.model_window = model_window
         self.min_interp_fps = min_interp_fps
         self.balanced_sampling = balanced_sampling
-        self.use_speed_filtered_inds = use_speed_filtered_inds
+        self.use_filtered_inds = use_filtered_inds
         self.virtual_rodent_x_splits = virtual_rodent_x_splits
         self.dataset_names = list(
             dict.fromkeys(dataset_names)
@@ -704,7 +704,7 @@ class RodentDiskDataset(Dataset):
         # still never passed between the generator and this loader directly).
         self.indices = {}
         self.window_size = {}
-        filtered_append = "_filtered_offsets" if self.use_speed_filtered_inds else ""
+        filtered_append = "_filtered_offsets" if self.use_filtered_inds else ""
         for h5_key in self.h5_paths.keys():
             base_name = self.h5_key_to_dataset_name[h5_key]
             if h5_key.startswith("pairr24m") or h5_key.startswith("sdannce"):
